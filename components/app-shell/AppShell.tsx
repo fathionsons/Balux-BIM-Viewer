@@ -1,9 +1,11 @@
 "use client";
 
 import * as React from "react";
+import { ChevronUp, ChevronDown } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 
+import { cn } from "../../lib/utils";
 import { useViewerStore } from "../../lib/viewer/viewerStore";
 import { ViewerProvider } from "../viewer/ViewerProvider";
 import { ViewerCanvas } from "../viewer/ViewerCanvas";
@@ -28,43 +30,86 @@ export function AppShell() {
 
 function Main() {
   const topTab = useViewerStore((s) => s.topTab);
+  const setIsTouchDevice = useViewerStore((s) => s.setIsTouchDevice);
   const rightPanelRef = React.useRef<ImperativePanelHandle | null>(null);
   const [rightCollapsed, setRightCollapsed] = React.useState(false);
+  const [mobileSheetOpen, setMobileSheetOpen] = React.useState(false);
+  const [isTouchDevice, setLocalIsTouchDevice] = React.useState(false);
+
+  React.useEffect(() => {
+    const mqCoarse = window.matchMedia("(pointer: coarse)");
+    const mqAnyCoarse = window.matchMedia("(any-pointer: coarse)");
+    const mqHoverNone = window.matchMedia("(hover: none)");
+
+    const sync = () => {
+      const hasTouchPoints = navigator.maxTouchPoints > 0;
+      const next =
+        mqCoarse.matches || (mqAnyCoarse.matches && mqHoverNone.matches) || (hasTouchPoints && mqHoverNone.matches);
+      setLocalIsTouchDevice(next);
+      setIsTouchDevice(next);
+    };
+
+    sync();
+    mqCoarse.addEventListener("change", sync);
+    mqAnyCoarse.addEventListener("change", sync);
+    mqHoverNone.addEventListener("change", sync);
+    return () => {
+      mqCoarse.removeEventListener("change", sync);
+      mqAnyCoarse.removeEventListener("change", sync);
+      mqHoverNone.removeEventListener("change", sync);
+    };
+  }, [setIsTouchDevice]);
 
   if (topTab !== "viewer") {
-    const title = topTab === "info" ? "Info" : topTab === "site" ? "Site" : "FM";
+    const title =
+      topTab === "info"
+        ? "Informationsstyring"
+        : topTab === "site"
+          ? "Byggepladsledelse"
+          : "Facility Management";
 
     return (
-      <div className="flex h-full items-center justify-center">
-        <div className="max-w-xl rounded-2xl border border-slate-200 bg-white/80 p-6 shadow-panel backdrop-blur">
+      <div className="flex h-full items-center justify-center px-4">
+        <div className="max-w-2xl rounded-2xl border border-slate-200 bg-white/85 p-6 shadow-panel backdrop-blur">
           <div className="text-lg font-semibold text-slate-900">{title}</div>
+          <div className="mt-2 text-sm text-slate-600">
+            Demo placeholder content. Switch to <span className="font-medium text-slate-900">BIM Viewer</span> to
+            navigate, inspect properties, cut/section, measure, filter/colorize, and review object history.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
-          {topTab === "info" ? (
-            <div className="mt-2 space-y-3 text-sm text-slate-700">
-              <div>
-                <span className="font-medium text-slate-900">BALUX — BIM Viewer (Web) by Fathi</span>
-              </div>
-              <div className="font-medium text-slate-900">Technologies used:</div>
-              <ul className="list-disc space-y-1 pl-5">
-                <li>Next.js + React + TypeScript</li>
-                <li>three.js</li>
-                <li>
-                  That Open Engine: <code>@thatopen/components</code>,{" "}
-                  <code>@thatopen/components-front</code>, <code>@thatopen/fragments</code>
-                </li>
-                <li>web-ifc</li>
-                <li>three-mesh-bvh</li>
-                <li>Zustand</li>
-                <li>Tailwind CSS + Radix UI</li>
-              </ul>
-            </div>
-          ) : (
-            <div className="mt-2 text-sm text-slate-600">
-              This is a placeholder tab. Switch back to{" "}
-              <span className="font-medium text-slate-900">BIM Viewer</span> to
-              interact with the model.
-            </div>
+  if (isTouchDevice) {
+    return (
+      <div className="relative h-full">
+        <ViewerCanvas />
+        <LeftToolbar />
+
+        <div
+          className={cn(
+            "absolute inset-x-0 bottom-0 z-30 transition-all duration-300",
+            mobileSheetOpen ? "h-[52%]" : "h-[40px]"
           )}
+        >
+          <div className="flex h-10 items-center justify-center border-t border-slate-200 bg-white/95">
+            <button
+              className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700"
+              onClick={() => setMobileSheetOpen((v) => !v)}
+            >
+              {mobileSheetOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
+              {mobileSheetOpen ? "Hide panel" : "Show panel"}
+            </button>
+          </div>
+
+          <div className="h-[calc(100%-40px)] overflow-hidden border-t border-slate-200 bg-white">
+            <RightPanel
+              collapsed={!mobileSheetOpen}
+              mobile
+              onToggleCollapse={() => setMobileSheetOpen((v) => !v)}
+            />
+          </div>
         </div>
       </div>
     );
@@ -102,3 +147,4 @@ function Main() {
     </PanelGroup>
   );
 }
+

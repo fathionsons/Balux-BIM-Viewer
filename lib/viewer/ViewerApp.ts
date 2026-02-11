@@ -13,8 +13,11 @@ import { SectionManager } from "./section/SectionManager";
 import { ToolManager } from "./tools/ToolManager";
 import { SelectTool } from "./tools/SelectTool";
 import { MeasureTool } from "./tools/MeasureTool";
+import { CutTool } from "./tools/CutTool";
 import { SectionBoxTool } from "./tools/SectionBoxTool";
 import {
+  type ViewerMeasurementMode,
+  type ViewerPropertyFilterState,
   type PropertiesPayload,
   type RawModelIdMap,
   type ViewerSelectionKey,
@@ -63,6 +66,31 @@ function addToMap(target: ModelIdMap, source: ModelIdMap) {
     }
     for (const id of ids) t.add(id);
   }
+}
+
+function cloneModelIdMap(source: ModelIdMap): ModelIdMap {
+  const out: ModelIdMap = {};
+  for (const [modelId, ids] of Object.entries(source)) {
+    out[modelId] = new Set(ids);
+  }
+  return out;
+}
+
+function subtractModelIdMap(a: ModelIdMap, b: ModelIdMap): ModelIdMap {
+  const out: ModelIdMap = {};
+  for (const [modelId, idsA] of Object.entries(a)) {
+    const idsB = b[modelId];
+    if (!idsB) {
+      if (idsA.size > 0) out[modelId] = new Set(idsA);
+      continue;
+    }
+    const diff = new Set<number>();
+    for (const id of idsA) {
+      if (!idsB.has(id)) diff.add(id);
+    }
+    if (diff.size > 0) out[modelId] = diff;
+  }
+  return out;
 }
 
 function isEmptyMap(map: ModelIdMap) {
@@ -159,6 +187,56 @@ function collectPsetsDeep(
   for (const v of Object.values(node)) collectPsetsDeep(v, out, visited);
 }
 
+function parseNumeric(value: string) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function compareByOperator(
+  candidate: string,
+  operator: ViewerPropertyFilterState["operator"],
+  expected: string
+) {
+  const c = candidate.trim();
+  const e = expected.trim();
+
+  if (operator === "contains") return c.toLowerCase().includes(e.toLowerCase());
+  if (operator === "equals") return c.toLowerCase() === e.toLowerCase();
+  if (operator === "not_equals") return c.toLowerCase() !== e.toLowerCase();
+
+  const cn = parseNumeric(c);
+  const en = parseNumeric(e);
+  if (cn == null || en == null) return false;
+  if (operator === "gt") return cn > en;
+  if (operator === "lt") return cn < en;
+  if (operator === "gte") return cn >= en;
+  if (operator === "lte") return cn <= en;
+  return false;
+}
+
+function closestPointsBetweenBoxes(a: THREE.Box3, b: THREE.Box3) {
+  const pA = new THREE.Vector3();
+  const pB = new THREE.Vector3();
+  const axes: Array<"x" | "y" | "z"> = ["x", "y", "z"];
+  for (const ax of axes) {
+    if (a.max[ax] < b.min[ax]) {
+      pA[ax] = a.max[ax];
+      pB[ax] = b.min[ax];
+      continue;
+    }
+    if (b.max[ax] < a.min[ax]) {
+      pA[ax] = a.min[ax];
+      pB[ax] = b.max[ax];
+      continue;
+    }
+    // Overlap in this axis: project both points to the overlapping interval.
+    const v = (Math.max(a.min[ax], b.min[ax]) + Math.min(a.max[ax], b.max[ax])) * 0.5;
+    pA[ax] = v;
+    pB[ax] = v;
+  }
+  return { pA, pB, distance: pA.distanceTo(pB) };
+}
+
 export type ViewerRaycastHit = {
   kind: "ifc" | "glb";
   point: THREE.Vector3;
@@ -205,11 +283,31 @@ export class ViewerApp {
   // Classification groups for fast filters/tree.
   private classGroupItems = new Map<string, ModelIdMap>();
   private storeyGroupItems = new Map<string, ModelIdMap>();
+  private classByItemByModel = new Map<string, Map<number, string>>();
+  private itemBoxesByModel = new Map<string, Map<number, THREE.Box3>>();
+  private itemCutSamplesByModel = new Map<
+    string,
+    Array<{ localId: number; sampleX: number; sampleZ: number; classId?: string }>
+  >();
+
+  private cutHidden: ModelIdMap = emptyModelIdMap();
+  private filteredOut: ModelIdMap = emptyModelIdMap();
+
+  private previousIfcSnapshot: Map<
+    string,
+    { name: string; tag: string; category: string; modelName: string }
+  > | null = null;
+  private measurementMeta = new Map<
+    string,
+    { mode: Exclude<ViewerMeasurementMode, "coords">; note?: string }
+  >();
 
   private fragmentsInitialized = false;
   private ifcInitialized = false;
 
   private manualHidden: ModelIdMap = emptyModelIdMap();
+  private appliedHidden: ModelIdMap = emptyModelIdMap();
+  private visibilityForceFullApply = true;
   private isolateActive = false;
   private hiddenBeforeIsolateRaw: Record<string, number[]> | null = null;
 
@@ -228,6 +326,15 @@ export class ViewerApp {
   // those materials also receive the active clipping planes.
   private sectionMaterialsNeedRefresh = false;
   private sectionMaterialsRefreshArmed = new Set<"hover" | "select">(["hover", "select"]);
+  private hoverRequestSerial = 0;
+  private hasHoverHighlight = false;
+  private hasSelectHighlight = false;
+  private hoverClearInFlight: Promise<void> | null = null;
+  private selectClearInFlight: Promise<void> | null = null;
+  private cutBounds: { xMin: number; xMax: number; zMin: number; zMax: number } | null = null;
+  private cutApplyRaf = 0;
+  private cutApplyQueued = false;
+  private cutApplyInFlight = false;
 
   private constructor(container: HTMLElement) {
     this.container = container;
@@ -269,25 +376,25 @@ export class ViewerApp {
     // Ensure Orbit mode is active (this is also the default after world assignment).
     this.cameraComponent.set("Orbit");
 
-    // camera-controls tuning for a "Blender-like" feel
+    // camera-controls tuning for Dalux-like BIM navigation.
     const controls = this.cameraComponent.controls;
-    controls.smoothTime = 0.08;
-    controls.draggingSmoothTime = 0.18;
-    controls.dollySpeed = 1.3;
-    controls.truckSpeed = 2.0;
-    controls.azimuthRotateSpeed = 0.9;
-    controls.polarRotateSpeed = 0.9;
-    controls.dollyToCursor = false;
-    controls.infinityDolly = false;
+    controls.smoothTime = 0.1;
+    controls.draggingSmoothTime = 0.12;
+    controls.dollySpeed = 0.9;
+    controls.truckSpeed = 1.5;
+    controls.azimuthRotateSpeed = 0.7;
+    controls.polarRotateSpeed = 0.7;
+    controls.dollyToCursor = true;
+    controls.infinityDolly = true;
     controls.minPolarAngle = 0.01;
     controls.maxPolarAngle = Math.PI / 2 - 0.02;
     controls.minDistance = 0.5;
     controls.maxDistance = 5000;
     controls.minZoom = 0.05;
     controls.maxZoom = 200;
-    controls.mouseButtons.left = CameraControls.ACTION.ROTATE;
-    controls.mouseButtons.right = CameraControls.ACTION.TRUCK;
-    controls.mouseButtons.middle = CameraControls.ACTION.DOLLY;
+    controls.mouseButtons.left = CameraControls.ACTION.NONE;
+    controls.mouseButtons.right = CameraControls.ACTION.ROTATE;
+    controls.mouseButtons.middle = CameraControls.ACTION.TRUCK;
     controls.mouseButtons.wheel = CameraControls.ACTION.DOLLY;
     controls.touches.one = CameraControls.ACTION.TOUCH_ROTATE;
     controls.touches.two = CameraControls.ACTION.TOUCH_DOLLY_TRUCK;
@@ -333,6 +440,7 @@ export class ViewerApp {
     this.tools = new ToolManager(this);
     this.tools.register(new SelectTool());
     this.tools.register(new MeasureTool());
+    this.tools.register(new CutTool());
     this.tools.register(new SectionBoxTool());
   }
 
@@ -355,22 +463,29 @@ export class ViewerApp {
     }
 
     // Highlighter (we drive it from our tool system; disable click handlers).
-    this.highlighter.setup({
-      world: this.world,
-      autoHighlightOnClick: false,
-      selectEnabled: false,
-      selectName: "select",
-      autoUpdateFragments: true,
-      selectMaterialDefinition: {
-        color: new THREE.Color("#f97316"),
-        renderedFaces: FRAGS.RenderedFaces.TWO,
-        opacity: 0.35,
-        transparent: true,
-        preserveOriginalMaterial: true,
-        depthTest: true,
-        depthWrite: false,
-      },
-    });
+    // ThatOpen registers a touchstart listener during setup; force passive to avoid
+    // scroll-blocking listener warnings without patching node_modules.
+    const restorePassiveTouch = this.forcePassiveTouchStart(this.rendererComponent.three.domElement);
+    try {
+      this.highlighter.setup({
+        world: this.world,
+        autoHighlightOnClick: false,
+        selectEnabled: false,
+        selectName: "select",
+        autoUpdateFragments: true,
+        selectMaterialDefinition: {
+          color: new THREE.Color("#f97316"),
+          renderedFaces: FRAGS.RenderedFaces.TWO,
+          opacity: 0.35,
+          transparent: true,
+          preserveOriginalMaterial: true,
+          depthTest: true,
+          depthWrite: false,
+        },
+      });
+    } finally {
+      restorePassiveTouch();
+    }
     this.highlighter.styles.set("hover", {
       color: new THREE.Color("#0ea5e9"),
       renderedFaces: FRAGS.RenderedFaces.TWO,
@@ -413,11 +528,17 @@ export class ViewerApp {
       this.statsFrames = 0;
       this.statsT0 = now;
 
-      const triangles = this.rendererComponent.three.info.render.triangles;
-      useViewerStore.getState().setStats({ fps, triangles });
+      const renderInfo = this.rendererComponent.three.info.render;
+      const triangles = renderInfo.triangles;
+      const drawCalls = renderInfo.calls;
+      useViewerStore.getState().setStats({ fps, triangles, drawCalls });
     };
     this.world.onAfterUpdate.add(cb);
     this.statsUnsub = () => this.world.onAfterUpdate.remove(cb);
+
+    // Section workflow defaults.
+    this.section.setMode("box");
+    this.section.setLockRotation(useViewerStore.getState().section.lockRotation);
 
     // Default tool.
     await this.setActiveTool("select");
@@ -453,6 +574,10 @@ export class ViewerApp {
     window.removeEventListener("keydown", this.onKeyDown);
 
     this.statsUnsub?.();
+    if (this.cutApplyRaf) cancelAnimationFrame(this.cutApplyRaf);
+    this.cutApplyRaf = 0;
+    this.cutApplyQueued = false;
+    this.cutApplyInFlight = false;
     this.disposeGlbRoot();
     this.section.dispose();
     this.measurements.dispose();
@@ -467,6 +592,8 @@ export class ViewerApp {
   async setActiveTool(tool: ViewerToolId) {
     useViewerStore.getState().setActiveTool(tool);
     await this.tools.setActive(tool);
+    if (tool === "cut") this.setCursor(this.getCutCursor());
+    this.noteHistory("tool", "Tool changed", tool);
   }
 
   private onPointerDown = (ev: PointerEvent) => {
@@ -510,6 +637,27 @@ export class ViewerApp {
     if (tag === "input" || tag === "textarea" || target?.isContentEditable) return;
 
     const key = ev.key.toLowerCase();
+    if (key === "q") {
+      void this.setActiveTool("select");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "m") {
+      void this.setActiveTool("measure");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "c") {
+      void this.setActiveTool("cut");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "b") {
+      void this.setActiveTool("section");
+      ev.preventDefault();
+      return;
+    }
+
     if (key === "f") {
       void this.frameSelection();
       ev.preventDefault();
@@ -536,6 +684,7 @@ export class ViewerApp {
       const activeTool = useViewerStore.getState().activeTool;
       if (activeTool !== "select") {
         void this.setActiveTool("select");
+        this.noteHistory("tool", "Tool canceled", "Esc switched back to Select tool.");
       } else {
         void this.clearSelection();
       }
@@ -543,7 +692,6 @@ export class ViewerApp {
       return;
     }
 
-    // Forward remaining keys to the active tool (e.g. section box W/E/R mode switching).
     void this.tools.onKeyDown(ev);
   };
 
@@ -685,7 +833,12 @@ export class ViewerApp {
     for (const m of materials) m.dispose();
   }
 
-  private async settleOrWarn(task: Promise<unknown>, timeoutMs: number, label: string) {
+  private async settleOrWarn(
+    task: Promise<unknown>,
+    timeoutMs: number,
+    label: string,
+    opts?: { warnOnTimeout?: boolean; warnOnReject?: boolean }
+  ) {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let timedOut = false;
     try {
@@ -698,14 +851,52 @@ export class ViewerApp {
           }, timeoutMs);
         }),
       ]);
-      if (timedOut) {
+      if (timedOut && opts?.warnOnTimeout !== false) {
         console.warn(`[ViewerApp] ${label} timed out after ${timeoutMs}ms.`);
       }
     } catch (err) {
-      console.warn(`[ViewerApp] ${label} failed.`, err);
+      if (opts?.warnOnReject !== false) {
+        console.warn(`[ViewerApp] ${label} failed.`, err);
+      }
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  private forcePassiveTouchStart(target: HTMLElement) {
+    const original = target.addEventListener.bind(target) as (
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: AddEventListenerOptions | boolean
+    ) => void;
+    const patched: typeof target.addEventListener = ((
+      type: string,
+      listener: EventListenerOrEventListenerObject | null,
+      options?: AddEventListenerOptions | boolean
+    ) => {
+      if (!listener) return;
+      if (type !== "touchstart") {
+        return original(type, listener, options);
+      }
+
+      if (options === undefined || options === false) {
+        return original(type, listener, { passive: true });
+      }
+      if (options === true) {
+        return original(type, listener, { capture: true, passive: true });
+      }
+
+      const opts = options as AddEventListenerOptions;
+      if (opts.passive === undefined) {
+        return original(type, listener, { ...opts, passive: true });
+      }
+      return original(type, listener, opts);
+    }) as typeof target.addEventListener;
+
+    target.addEventListener = patched;
+    return () => {
+      target.addEventListener = original as typeof target.addEventListener;
+    };
   }
 
   private updateCameraBoundsFromBox(box: THREE.Box3) {
@@ -718,6 +909,21 @@ export class ViewerApp {
     const controls = this.cameraComponent.controls;
     controls.minDistance = Math.max(0.2, diag * 0.01);
     controls.maxDistance = Math.max(200, diag * 20);
+
+    const cam = this.cameraComponent.three;
+    if (cam instanceof THREE.PerspectiveCamera) {
+      cam.near = Math.max(0.01, diag * 0.001);
+      cam.far = Math.max(100, diag * 50);
+      cam.updateProjectionMatrix();
+    }
+
+    this.cutBounds = {
+      xMin: box.min.x,
+      xMax: box.max.x,
+      zMin: box.min.z,
+      zMax: box.max.z,
+    };
+    this.syncCutRangeForOrientation(useViewerStore.getState().cut.orientation, { center: true });
   }
 
   private clampCameraAboveGround() {
@@ -742,17 +948,155 @@ export class ViewerApp {
     }
   }
 
+  private noteHistory(
+    type:
+      | "selection"
+      | "visibility"
+      | "properties"
+      | "measurement"
+      | "filter"
+      | "revision"
+      | "tool"
+      | "load",
+    title: string,
+    details?: string
+  ) {
+    useViewerStore.getState().pushHistory({ type, title, details });
+  }
+
+  private async yieldToMainThread() {
+    await new Promise<void>((resolve) => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => resolve());
+      } else {
+        setTimeout(() => resolve(), 0);
+      }
+    });
+  }
+
+  private queueApplyCut() {
+    if (this.disposed) return;
+    this.cutApplyQueued = true;
+    if (this.cutApplyRaf) return;
+
+    this.cutApplyRaf = requestAnimationFrame(() => {
+      this.cutApplyRaf = 0;
+      void this.flushCutQueue();
+    });
+  }
+
+  private async flushCutQueue() {
+    if (this.cutApplyInFlight || this.disposed) return;
+    this.cutApplyInFlight = true;
+    try {
+      while (this.cutApplyQueued && !this.disposed) {
+        this.cutApplyQueued = false;
+        await this.applyCutFromState();
+      }
+    } finally {
+      this.cutApplyInFlight = false;
+    }
+  }
+
+  private hasIfcModels() {
+    return this.fragments.list.size > 0;
+  }
+
+  getCutCursor(orientation = useViewerStore.getState().cut.orientation) {
+    return orientation === "horizontal" ? "ns-resize" : "ew-resize";
+  }
+
+  getCutState() {
+    return useViewerStore.getState().cut;
+  }
+
+  private syncCutRangeForOrientation(
+    orientation: "horizontal" | "vertical",
+    opts?: { center?: boolean; preserveRatio?: boolean }
+  ) {
+    const bounds = this.cutBounds;
+    if (!bounds) return;
+
+    const min = orientation === "horizontal" ? bounds.zMin : bounds.xMin;
+    const max = orientation === "horizontal" ? bounds.zMax : bounds.xMax;
+    const span = max - min;
+    const cut = useViewerStore.getState().cut;
+
+    let offset = cut.offset;
+    if (opts?.center || !Number.isFinite(offset)) {
+      offset = min + span * 0.5;
+    } else if (opts?.preserveRatio) {
+      const prevSpan = cut.max - cut.min;
+      const t = prevSpan > 1e-6 ? (cut.offset - cut.min) / prevSpan : 0.5;
+      offset = min + THREE.MathUtils.clamp(t, 0, 1) * span;
+    }
+    offset = THREE.MathUtils.clamp(offset, min, max);
+
+    useViewerStore.getState().setCut({ orientation, min, max, offset });
+  }
+
+  getMeasurementMode(): ViewerMeasurementMode {
+    return useViewerStore.getState().measurementMode;
+  }
+
+  setMeasurementMode(mode: ViewerMeasurementMode) {
+    useViewerStore.getState().setMeasurementMode(mode);
+    this.noteHistory("tool", "Measurement mode", `Mode set to ${mode}.`);
+  }
+
+  setCoordinateReadout(point: THREE.Vector3) {
+    useViewerStore.getState().setCoordinates({ x: point.x, y: point.y, z: point.z });
+    this.noteHistory(
+      "measurement",
+      "Coordinate sampled",
+      `X ${point.x.toFixed(3)}, Y ${point.y.toFixed(3)}, Z ${point.z.toFixed(3)}`
+    );
+  }
+
+  noteShortestFrom(key: ViewerSelectionKey) {
+    this.noteHistory(
+      "measurement",
+      "Shortest-distance pick A",
+      `Model ${key.modelId}, local ID ${key.localId}`
+    );
+  }
+
   async clearHover() {
+    this.hoverRequestSerial += 1;
     useViewerStore.getState().setHovered(null);
-    await this.settleOrWarn(this.highlighter.clear("hover"), 4000, "highlighter.clear(hover)");
+    if (!this.hasHoverHighlight) return;
+    if (!this.fragments.initialized || this.fragments.list.size === 0) {
+      this.hasHoverHighlight = false;
+      return;
+    }
+
+    if (this.hoverClearInFlight) {
+      await this.hoverClearInFlight;
+      return;
+    }
+
+    const clearTask = (async () => {
+      await this.settleOrWarn(this.highlighter.clear("hover"), 1200, "highlighter.clear(hover)", {
+        warnOnTimeout: false,
+        warnOnReject: false,
+      });
+      this.hasHoverHighlight = false;
+    })();
+    this.hoverClearInFlight = clearTask.finally(() => {
+      this.hoverClearInFlight = null;
+    });
+    await this.hoverClearInFlight;
   }
 
   async hoverFromPointerEvent(ev: PointerEvent) {
+    const requestId = ++this.hoverRequestSerial;
     const hit = await this.raycastFromPointerEvent(ev);
+    if (requestId !== this.hoverRequestSerial) return;
+
     const prev = useViewerStore.getState().hovered;
 
     if (!hit || hit.kind !== "ifc" || hit.modelId == null || hit.localId == null) {
-      if (prev) await this.clearHover();
+      if (prev || this.hasHoverHighlight) await this.clearHover();
       return;
     }
 
@@ -764,6 +1108,8 @@ export class ViewerApp {
     const exclude = rawToModelIdMap(useViewerStore.getState().selection);
     this.armSectionMaterialsRefresh("hover");
     await this.highlighter.highlightByID("hover", { [key.modelId]: new Set([key.localId]) }, true, false, exclude);
+    if (requestId !== this.hoverRequestSerial) return;
+    this.hasHoverHighlight = true;
     this.refreshSectionMaterialsIfNeeded();
   }
 
@@ -792,8 +1138,13 @@ export class ViewerApp {
     useViewerStore.getState().setSelection(raw, key);
     this.armSectionMaterialsRefresh("select");
     await this.highlighter.highlightByID("select", map, true, false);
+    this.hasSelectHighlight = true;
     this.refreshSectionMaterialsIfNeeded();
-    await this.cameraComponent.setOrbitToItems(map);
+    this.noteHistory(
+      "selection",
+      "Element selected",
+      `Model ${key.modelId}, local ID ${key.localId}${opts.multi ? " (multi-select)" : ""}`
+    );
     await this.updateProperties(key);
   }
 
@@ -814,7 +1165,28 @@ export class ViewerApp {
   async clearSelection() {
     useViewerStore.getState().setSelection({}, null);
     useViewerStore.getState().setProperties(null);
-    await this.settleOrWarn(this.highlighter.clear("select"), 4000, "highlighter.clear(select)");
+    if (!this.hasSelectHighlight) return;
+    if (!this.fragments.initialized || this.fragments.list.size === 0) {
+      this.hasSelectHighlight = false;
+      return;
+    }
+
+    if (this.selectClearInFlight) {
+      await this.selectClearInFlight;
+      return;
+    }
+
+    const clearTask = (async () => {
+      await this.settleOrWarn(this.highlighter.clear("select"), 1200, "highlighter.clear(select)", {
+        warnOnTimeout: false,
+        warnOnReject: false,
+      });
+      this.hasSelectHighlight = false;
+    })();
+    this.selectClearInFlight = clearTask.finally(() => {
+      this.selectClearInFlight = null;
+    });
+    await this.selectClearInFlight;
   }
 
   async frameSelection() {
@@ -824,22 +1196,55 @@ export class ViewerApp {
     await this.cameraComponent.fitToItems(map);
   }
 
+  private collectMeshesFromObject(root: THREE.Object3D) {
+    const meshes: THREE.Mesh[] = [];
+    root.traverse((obj: THREE.Object3D) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.isMesh) meshes.push(mesh);
+    });
+    return meshes;
+  }
+
+  private centerCameraTargetToMeshes(meshes: THREE.Mesh[]) {
+    if (meshes.length === 0) return;
+    const bounds = new THREE.Box3();
+    const tmp = new THREE.Box3();
+    const center = new THREE.Vector3();
+    const pos = new THREE.Vector3();
+    const target = new THREE.Vector3();
+
+    bounds.makeEmpty();
+    for (const mesh of meshes) {
+      mesh.updateWorldMatrix(true, false);
+      tmp.setFromObject(mesh);
+      bounds.union(tmp);
+    }
+    if (bounds.isEmpty()) return;
+
+    bounds.getCenter(center);
+    const controls = this.cameraComponent.controls;
+    controls.getPosition(pos);
+    controls.getTarget(target);
+    const delta = pos.sub(target);
+    const nextPos = center.clone().add(delta);
+
+    void controls.setLookAt(nextPos.x, nextPos.y, nextPos.z, center.x, center.y, center.z, false);
+  }
+
   async frameModel() {
-    // Fit camera to loaded model(s).
-    // For IFC we can fit to the world's meshes; for GLB we collect meshes from the loaded root.
+    const meshes: THREE.Mesh[] = [];
+
     if (this.fragments.list.size > 0) {
-      await this.cameraComponent.fit(this.world.meshes, 1.2);
-      return;
+      for (const model of this.fragments.list.values()) {
+        meshes.push(...this.collectMeshesFromObject(model.object));
+      }
+    } else if (this.glbRoot) {
+      meshes.push(...this.collectMeshesFromObject(this.glbRoot));
     }
 
-    if (this.glbRoot) {
-      const meshes: THREE.Mesh[] = [];
-      this.glbRoot.traverse((obj: THREE.Object3D) => {
-        const mesh = obj as THREE.Mesh;
-        if (mesh.isMesh) meshes.push(mesh);
-      });
-      if (meshes.length > 0) await this.cameraComponent.fit(meshes, 1.2);
-    }
+    if (meshes.length === 0) return;
+    await this.cameraComponent.fit(meshes, 1.15);
+    this.centerCameraTargetToMeshes(meshes);
   }
 
   async loadIfcFromUrl(url: string, name: string) {
@@ -850,7 +1255,7 @@ export class ViewerApp {
   }
 
   async loadGlbFromUrl(url: string, name: string) {
-    const timeoutMs = 120000;
+    const timeoutMs = 300000;
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = setTimeout(() => controller?.abort(), timeoutMs);
 
@@ -860,37 +1265,9 @@ export class ViewerApp {
     try {
       const resp = await fetch(url, controller ? { signal: controller.signal } : undefined);
       if (!resp.ok) throw new Error(`Failed to fetch GLB (${resp.status}) from ${url}`);
-
-      let buffer: ArrayBuffer;
-      const contentLength = Number(resp.headers.get("content-length") ?? "0");
-      if (resp.body && Number.isFinite(contentLength) && contentLength > 0) {
-        const reader = resp.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let loaded = 0;
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (!value) continue;
-          chunks.push(value);
-          loaded += value.byteLength;
-          useViewerStore.getState().setLoading({
-            active: true,
-            label: "Downloading GLB...",
-            progress: Math.min(0.95, loaded / contentLength),
-          });
-        }
-        const merged = new Uint8Array(loaded);
-        let offset = 0;
-        for (const chunk of chunks) {
-          merged.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        buffer = merged.buffer;
-      } else {
-        buffer = await resp.arrayBuffer();
-      }
-
-      useViewerStore.getState().setLoading({ active: true, label: "Parsing GLB...", progress: 0.05 });
+      useViewerStore.getState().setLoading({ active: true, label: "Downloading GLB...", progress: 0.35 });
+      const buffer = await resp.arrayBuffer();
+      useViewerStore.getState().setLoading({ active: true, label: "Parsing GLB...", progress: 0.7 });
       await this.loadGlbFromBuffer(buffer, name);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -917,6 +1294,10 @@ export class ViewerApp {
       await this.clearHover();
       this.measurements.clear();
       useViewerStore.getState().clearMeasurements();
+      useViewerStore.getState().setCoordinates(null);
+      useViewerStore.getState().resetPropertyFilter();
+      this.cutHidden = emptyModelIdMap();
+      this.filteredOut = emptyModelIdMap();
 
       // Reset section-material bookkeeping for the new model.
       this.sectionMaterialsNeedRefresh = false;
@@ -941,14 +1322,19 @@ export class ViewerApp {
 
       this.classGroupItems.clear();
       this.storeyGroupItems.clear();
+      this.classByItemByModel.clear();
+      this.itemBoxesByModel.clear();
+      this.itemCutSamplesByModel.clear();
       useViewerStore.getState().setClassGroups([]);
       useViewerStore.getState().setStoreyGroups([]);
       this.manualHidden = emptyModelIdMap();
+      this.appliedHidden = emptyModelIdMap();
+      this.visibilityForceFullApply = true;
       this.isolateActive = false;
       this.hiddenBeforeIsolateRaw = null;
 
       const loader = new GLTFLoader();
-      const parseTimeoutMs = 120000;
+      const parseTimeoutMs = 300000;
       useViewerStore.getState().setLoading({ active: true, label: "Parsing GLB...", progress: 0.1 });
       const gltf = await new Promise<GLTF>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -973,6 +1359,7 @@ export class ViewerApp {
       toast.success("Model loaded", {
         description: `${name} (visual model, no BIM metadata)`,
       });
+      this.noteHistory("load", "GLB loaded", `${name} loaded as visual model.`);
     } finally {
       useViewerStore.getState().setLoading({ active: false, label: "", progress: 1 });
     }
@@ -988,6 +1375,10 @@ export class ViewerApp {
     await this.clearHover();
     this.measurements.clear();
     useViewerStore.getState().clearMeasurements();
+    useViewerStore.getState().setCoordinates(null);
+    useViewerStore.getState().resetPropertyFilter();
+    this.cutHidden = emptyModelIdMap();
+    this.filteredOut = emptyModelIdMap();
 
     // Reset section-material bookkeeping for the new model.
     this.sectionMaterialsNeedRefresh = false;
@@ -1007,7 +1398,12 @@ export class ViewerApp {
 
     this.classGroupItems.clear();
     this.storeyGroupItems.clear();
+    this.classByItemByModel.clear();
+    this.itemBoxesByModel.clear();
+    this.itemCutSamplesByModel.clear();
     this.manualHidden = emptyModelIdMap();
+    this.appliedHidden = emptyModelIdMap();
+    this.visibilityForceFullApply = true;
     this.isolateActive = false;
     this.hiddenBeforeIsolateRaw = null;
 
@@ -1059,8 +1455,18 @@ export class ViewerApp {
     // Populate class + storey groups for UI (tree/filters).
     await this.buildGroupsForModel(model);
 
+    // Keep visibility/cut/filter states coherent after loading.
+    await this.applyVisibilityFromState();
+    await this.applyCutFromState();
+
+    // Compare against previous IFC revision snapshot and store current one.
+    const currentSnapshot = await this.captureRevisionSnapshot(model, name);
+    this.compareRevisionSnapshots(this.previousIfcSnapshot, currentSnapshot);
+    this.previousIfcSnapshot = currentSnapshot;
+
     useViewerStore.getState().setLoading({ active: false, label: "", progress: 1 });
     toast.success("Model loaded", { description: name });
+    this.noteHistory("load", "IFC loaded", `${name} loaded successfully.`);
   }
 
   private async finishGlbLoad(gltf: GLTF, name: string) {
@@ -1077,33 +1483,29 @@ export class ViewerApp {
     this.glbBounds = box.clone();
     this.updateCameraBoundsFromBox(box);
 
-    // Section plane bounds from model bounding box + reset section box.
-    const center = new THREE.Vector3();
-    box.getCenter(center);
-    useViewerStore.getState().setSectionPlane({
-      min: box.min.z,
-      max: box.max.z,
-      offset: center.z,
-      axis: "z",
-    });
-    this.section.setPlaneBounds(box.min.z, box.max.z);
-    this.section.setPlaneAxis("z");
-    this.section.setPlaneOffset(center.z);
+    // Section box starts from model bounds.
     this.section.resetBoxToBounds(box);
 
     // Register materials for clipping and frame quickly so the user can interact immediately.
     this.section.registerMaterialsFrom(root);
     await this.frameModel();
+    this.cameraComponent.enabled = true;
 
-    // Build BVH asynchronously in the background so large GLBs appear fast.
-    void this.bvh.buildForObject(root).catch((err) => {
-      console.warn("Background GLB BVH build failed.", err);
+    // NOTE: We intentionally skip GLB BVH building here.
+    // If the BVH worker is unavailable, three-mesh-bvh local fallback can block the main thread
+    // for large GLBs and freeze interaction right after loading.
+    // IFC models still get BVH through the dedicated IFC pipeline.
+
+    await this.settleOrWarn(this.applyCutFromState(), 1500, "applyCutFromState(GLB)", {
+      warnOnTimeout: false,
+      warnOnReject: false,
     });
   }
 
   private async buildGroupsForModel(model: FRAGS.FragmentsModel) {
     // Classes by IFC category.
     const cats = await model.getItemsOfCategories([/.*/i]);
+    const classByItem = new Map<number, string>();
     const classGroups = Object.entries(cats)
       .map(([category, ids]) => ({
         id: category,
@@ -1113,13 +1515,37 @@ export class ViewerApp {
       .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 
     for (const [category, ids] of Object.entries(cats)) {
+      for (const lid of ids) classByItem.set(lid, category);
       this.classGroupItems.set(category, { [model.modelId]: new Set(ids) });
     }
+    this.classByItemByModel.set(model.modelId, classByItem);
     useViewerStore.getState().setClassGroups(classGroups);
+
+    // Cache per-item boxes for cut + shortest-distance measurement.
+    const geometryIds = await model.getItemsIdsWithGeometry();
+    const geometryBoxes = await model.getBoxes(geometryIds);
+    const boxMap = new Map<number, THREE.Box3>();
+    const cutSamples: Array<{ localId: number; sampleX: number; sampleZ: number; classId?: string }> = [];
+    const tmpCenter = new THREE.Vector3();
+    for (let i = 0; i < geometryIds.length; i++) {
+      const lid = geometryIds[i];
+      const b = geometryBoxes[i];
+      if (!b) continue;
+      boxMap.set(lid, b.clone());
+      b.getCenter(tmpCenter);
+      cutSamples.push({
+        localId: lid,
+        sampleX: tmpCenter.x,
+        sampleZ: tmpCenter.z,
+        classId: classByItem.get(lid),
+      });
+    }
+    this.itemBoxesByModel.set(model.modelId, boxMap);
+    this.itemCutSamplesByModel.set(model.modelId, cutSamples);
 
     // Storeys by spatial structure (IFCBUILDINGSTOREY).
     const spatial = await model.getSpatialStructure();
-    const geomIds = new Set(await model.getItemsIdsWithGeometry());
+    const geomIds = new Set(geometryIds);
 
     const storeys: Array<{ localId: number; ids: number[] }> = [];
     const walk = (node: FRAGS.SpatialTreeItem) => {
@@ -1149,22 +1575,9 @@ export class ViewerApp {
     storeyGroups.sort((a, b) => a.label.localeCompare(b.label));
     useViewerStore.getState().setStoreyGroups(storeyGroups);
 
-    // Section plane bounds from model bounding box.
+    // Camera and cut bounds from model bounding box.
     const box = model.box.clone();
     this.updateCameraBoundsFromBox(box);
-    const center = new THREE.Vector3();
-    box.getCenter(center);
-    const min = box.min;
-    const max = box.max;
-    useViewerStore.getState().setSectionPlane({
-      min: min.z,
-      max: max.z,
-      offset: center.z,
-      axis: "z",
-    });
-    this.section.setPlaneBounds(min.z, max.z);
-    this.section.setPlaneAxis("z");
-    this.section.setPlaneOffset(center.z);
 
     // Initialize section box to cover the model (even if disabled by default).
     this.section.resetBoxToBounds(box);
@@ -1175,22 +1588,26 @@ export class ViewerApp {
     const map = rawToModelIdMap(raw);
     if (isEmptyMap(map)) return;
 
-    await this.hider.set(false, map);
     addToMap(this.manualHidden, map);
+    await this.applyVisibilityFromState();
     await this.clearSelection();
     toast("Hidden objects", { description: `Hidden ${countModelIdMap(map)} item(s).` });
+    this.noteHistory("visibility", "Hidden elements", `${countModelIdMap(map)} item(s) hidden.`);
   }
 
   async isolateSelected() {
     const raw = useViewerStore.getState().selection;
     const map = rawToModelIdMap(raw);
     if (isEmptyMap(map)) return;
+    if (!this.hasIfcModels()) return;
 
     if (!this.isolateActive) {
       this.hiddenBeforeIsolateRaw = await this.hider.getVisibilityMap(false);
       await this.hider.isolate(map);
+      this.visibilityForceFullApply = true;
       this.isolateActive = true;
       toast("Isolation", { description: `Isolated ${countModelIdMap(map)} item(s).` });
+      this.noteHistory("visibility", "Isolation enabled", `${countModelIdMap(map)} item(s) isolated.`);
     } else {
       await this.restoreIsolation();
     }
@@ -1201,43 +1618,77 @@ export class ViewerApp {
     this.hiddenBeforeIsolateRaw = null;
     await this.applyVisibilityFromState();
     toast("Isolation", { description: "Restored previous visibility." });
+    this.noteHistory("visibility", "Isolation cleared", "Previous visibility restored.");
   }
 
   async unhideAll() {
-    await this.hider.set(true);
+    if (this.hasIfcModels()) {
+      await this.hider.set(true);
+    }
     this.manualHidden = emptyModelIdMap();
+    this.appliedHidden = emptyModelIdMap();
+    this.visibilityForceFullApply = false;
     this.isolateActive = false;
     this.hiddenBeforeIsolateRaw = null;
     useViewerStore.getState().resetFilters();
+    this.cutHidden = emptyModelIdMap();
+    this.filteredOut = emptyModelIdMap();
     toast("Visibility", { description: "All objects visible." });
+    this.noteHistory("visibility", "Unhide all", "All elements are now visible.");
   }
 
   async setClassVisible(groupId: string, visible: boolean) {
     useViewerStore.getState().setClassVisibility(groupId, visible);
     await this.applyVisibilityFromState();
+    this.noteHistory("visibility", "Class visibility changed", `${groupId}: ${visible ? "shown" : "hidden"}`);
   }
 
   async setStoreyVisible(groupId: string, visible: boolean) {
     useViewerStore.getState().setStoreyVisibility(groupId, visible);
     await this.applyVisibilityFromState();
+    this.noteHistory(
+      "visibility",
+      "Storey visibility changed",
+      `${groupId}: ${visible ? "shown" : "hidden"}`
+    );
   }
 
   private async applyVisibilityFromState() {
     if (this.isolateActive) return;
 
     const s = useViewerStore.getState();
-    const hide: ModelIdMap = emptyModelIdMap();
+    const nextHide: ModelIdMap = emptyModelIdMap();
 
     for (const [id, items] of this.classGroupItems) {
-      if (s.classVisibility[id] === false) addToMap(hide, items);
+      if (s.classVisibility[id] === false) addToMap(nextHide, items);
     }
     for (const [id, items] of this.storeyGroupItems) {
-      if (s.storeyVisibility[id] === false) addToMap(hide, items);
+      if (s.storeyVisibility[id] === false) addToMap(nextHide, items);
     }
-    addToMap(hide, this.manualHidden);
+    addToMap(nextHide, this.manualHidden);
+    addToMap(nextHide, this.cutHidden);
+    addToMap(nextHide, this.filteredOut);
 
-    await this.hider.set(true);
-    if (!isEmptyMap(hide)) await this.hider.set(false, hide);
+    if (!this.hasIfcModels()) {
+      this.appliedHidden = cloneModelIdMap(nextHide);
+      this.visibilityForceFullApply = false;
+      return;
+    }
+
+    if (this.visibilityForceFullApply) {
+      await this.hider.set(true);
+      if (!isEmptyMap(nextHide)) await this.hider.set(false, nextHide);
+      this.appliedHidden = cloneModelIdMap(nextHide);
+      this.visibilityForceFullApply = false;
+      return;
+    }
+
+    const toHide = subtractModelIdMap(nextHide, this.appliedHidden);
+    const toShow = subtractModelIdMap(this.appliedHidden, nextHide);
+
+    if (!isEmptyMap(toShow)) await this.hider.set(true, toShow);
+    if (!isEmptyMap(toHide)) await this.hider.set(false, toHide);
+    this.appliedHidden = cloneModelIdMap(nextHide);
   }
 
   async selectGroup(group: { type: "class" | "storey"; id: string }) {
@@ -1256,43 +1707,82 @@ export class ViewerApp {
     useViewerStore.getState().setSelection(raw, primary);
     this.armSectionMaterialsRefresh("select");
     await this.highlighter.highlightByID("select", map, true, false);
+    this.hasSelectHighlight = true;
     this.refreshSectionMaterialsIfNeeded();
+    this.noteHistory("selection", "Group selected", `${group.type} ${group.id}`);
     if (primary) await this.updateProperties(primary);
   }
 
-  addMeasurement(start: THREE.Vector3, end: THREE.Vector3) {
-    const id = this.measurements.add(start, end);
-    useViewerStore.getState().setMeasurements(
-      this.measurements.list().map((m) => ({
+  private syncMeasurementsFromScene() {
+    const next = this.measurements.list().map((m) => {
+      const meta = this.measurementMeta.get(m.id);
+      return {
         id: m.id,
-        start: [m.start.x, m.start.y, m.start.z],
-        end: [m.end.x, m.end.y, m.end.z],
+        kind: "distance" as const,
+        mode: meta?.mode ?? "point",
+        start: [m.start.x, m.start.y, m.start.z] as [number, number, number],
+        end: [m.end.x, m.end.y, m.end.z] as [number, number, number],
         meters: m.meters,
-      }))
-    );
-    toast("Measurement added", { description: "Distance measurement created." });
+        note: meta?.note,
+      };
+    });
+    useViewerStore.getState().setMeasurements(next);
+  }
+
+  addDistanceMeasurement(
+    start: THREE.Vector3,
+    end: THREE.Vector3,
+    mode: Exclude<ViewerMeasurementMode, "coords"> = "point",
+    note?: string
+  ) {
+    const id = this.measurements.add(start, end);
+    this.measurementMeta.set(id, { mode, note });
+    this.syncMeasurementsFromScene();
+    toast("Measurement added", { description: `${start.distanceTo(end).toFixed(3)} m` });
+    this.noteHistory("measurement", "Distance measured", `${start.distanceTo(end).toFixed(3)} m (${mode}).`);
     return id;
+  }
+
+  async measureShortestDistanceBetween(a: ViewerSelectionKey, b: ViewerSelectionKey) {
+    const boxA = this.itemBoxesByModel.get(a.modelId)?.get(a.localId) ?? null;
+    const boxB = this.itemBoxesByModel.get(b.modelId)?.get(b.localId) ?? null;
+    if (!boxA || !boxB) {
+      toast.error("Shortest distance unavailable", {
+        description: "Element bounds are missing for one or both selections.",
+      });
+      return;
+    }
+
+    const { pA, pB, distance } = closestPointsBetweenBoxes(boxA, boxB);
+    this.addDistanceMeasurement(
+      pA,
+      pB,
+      "shortest",
+      `A ${a.localId} -> B ${b.localId} (AABB approximation)`
+    );
+    toast("Shortest distance", {
+      description: `${distance.toFixed(3)} m (bounding-box approximation)`,
+    });
   }
 
   removeMeasurement(id: string) {
     this.measurements.remove(id);
+    this.measurementMeta.delete(id);
     useViewerStore.getState().removeMeasurement(id);
   }
 
   clearMeasurements() {
     this.measurements.clear();
+    this.measurementMeta.clear();
     useViewerStore.getState().clearMeasurements();
   }
 
   setSectionEnabled(enabled: boolean) {
     useViewerStore.getState().setSection({ enabled });
     this.section.setEnabled(enabled);
+    this.section.setMode("box");
     if (enabled) this.refreshSectionMaterialsIfNeeded();
-  }
-
-  setSectionMode(mode: "box" | "plane") {
-    useViewerStore.getState().setSection({ mode });
-    this.section.setMode(mode);
+    this.noteHistory("tool", enabled ? "Section enabled" : "Section disabled");
   }
 
   setSectionInvert(invert: boolean) {
@@ -1300,27 +1790,7 @@ export class ViewerApp {
     this.section.setInvert(invert);
   }
 
-  setSectionPlane(axis: "x" | "y" | "z", offset: number) {
-    const first = [...this.fragments.list.values()][0];
-    const box = first?.box ?? this.glbBounds;
-
-    if (box) {
-      const min = axis === "x" ? box.min.x : axis === "y" ? box.min.y : box.min.z;
-      const max = axis === "x" ? box.max.x : axis === "y" ? box.max.y : box.max.z;
-      const clamped = Math.min(Math.max(offset, min), max);
-      useViewerStore.getState().setSectionPlane({ axis, min, max, offset: clamped });
-      this.section.setPlaneBounds(min, max);
-      this.section.setPlaneAxis(axis);
-      this.section.setPlaneOffset(clamped);
-      return;
-    }
-    useViewerStore.getState().setSectionPlane({ axis, offset });
-    this.section.setPlaneAxis(axis);
-    this.section.setPlaneOffset(offset);
-  }
-
   resetSectionBox() {
-    // Reset to the current model bbox (IFC first, else GLB).
     const first = [...this.fragments.list.values()][0];
     if (first) {
       this.section.resetBoxToBounds(first.box);
@@ -1331,34 +1801,394 @@ export class ViewerApp {
 
   enableSectionEditing(active: boolean) {
     const s = useViewerStore.getState().section;
-    if (active) {
-      if (!s.enabled) {
-        this.setSectionEnabled(true);
-      }
-      if (s.mode !== "box") {
-        this.setSectionMode("box");
-      }
-    }
+    if (active && !s.enabled) this.setSectionEnabled(true);
     this.section.setBoxEditing(active);
+    this.section.setTransformMode(s.transformMode);
+    this.section.setLockRotation(s.lockRotation);
     if (!active) this.cameraComponent.enabled = true;
   }
 
   setSectionTransformMode(mode: "translate" | "rotate" | "scale") {
-    this.section.setTransformMode(mode);
+    const { lockRotation } = useViewerStore.getState().section;
+    const nextMode = lockRotation && mode === "rotate" ? "translate" : mode;
+    useViewerStore.getState().setSection({ transformMode: nextMode });
+    this.section.setTransformMode(nextMode);
+  }
+
+  setSectionLockRotation(locked: boolean) {
+    useViewerStore.getState().setSection({ lockRotation: locked });
+    this.section.setLockRotation(locked);
+    if (locked) {
+      this.setSectionTransformMode("translate");
+    }
+  }
+
+  enableCut(enabled: boolean) {
+    useViewerStore.getState().setCut({ enabled });
+    this.queueApplyCut();
+    this.noteHistory("tool", enabled ? "Cut enabled" : "Cut disabled");
+  }
+
+  setCutOrientation(orientation: "horizontal" | "vertical") {
+    useViewerStore.getState().setCut({ orientation });
+    this.syncCutRangeForOrientation(orientation, { preserveRatio: true });
+    if (useViewerStore.getState().activeTool === "cut") this.setCursor(this.getCutCursor(orientation));
+    this.queueApplyCut();
+  }
+
+  setCutFlip(flip: boolean) {
+    useViewerStore.getState().setCut({ flip });
+    this.queueApplyCut();
+  }
+
+  setCutOffset(offset: number) {
+    const cut = useViewerStore.getState().cut;
+    const clamped = Math.min(Math.max(offset, cut.min), cut.max);
+    useViewerStore.getState().setCut({ offset: clamped });
+    this.queueApplyCut();
+  }
+
+  setCutIgnoredClass(classId: string, ignored: boolean) {
+    useViewerStore.getState().setCutIgnoredClass(classId, ignored);
+    this.queueApplyCut();
+  }
+
+  private collectFilterValues(
+    rawData: unknown,
+    psetName: string,
+    propName: string
+  ) {
+    const psetNeedle = psetName.trim().toLowerCase();
+    const propNeedle = propName.trim().toLowerCase();
+    const out: string[] = [];
+
+    if (!isRecord(rawData)) return out;
+
+    // Top-level attributes fallback.
+    for (const [k, v] of Object.entries(rawData)) {
+      if (Array.isArray(v)) continue;
+      if (isRecord(v) && !("value" in v)) continue;
+      if (propNeedle && k.toLowerCase() !== propNeedle) continue;
+      const value = toStringValue(v);
+      if (value) out.push(value);
+    }
+
+    const psets: PropertiesPayload["psets"] = [];
+    collectPsetsDeep(rawData, psets);
+    for (const pset of psets) {
+      if (psetNeedle && !pset.name.toLowerCase().includes(psetNeedle)) continue;
+      for (const prop of pset.props) {
+        if (propNeedle && !prop.name.toLowerCase().includes(propNeedle)) continue;
+        if (prop.value) out.push(prop.value);
+      }
+    }
+
+    return out;
+  }
+
+  async applyPropertyFilterFromState() {
+    const filter = useViewerStore.getState().propertyFilter;
+    if (!filter.property.trim() || !filter.value.trim()) {
+      toast.error("Filter is incomplete", {
+        description: "Set at least property name and value.",
+      });
+      return;
+    }
+
+    useViewerStore.getState().setLoading({
+      active: true,
+      label: "Applying property filter...",
+      progress: 0,
+    });
+
+    try {
+      const matches: ModelIdMap = emptyModelIdMap();
+      const nonMatches: ModelIdMap = emptyModelIdMap();
+      const modelInfos: Array<{ model: FRAGS.FragmentsModel; ids: number[] }> = [];
+
+      let total = 0;
+      for (const model of this.fragments.list.values()) {
+        const ids = await model.getItemsIdsWithGeometry();
+        if (ids.length === 0) continue;
+        modelInfos.push({ model, ids });
+        total += ids.length;
+      }
+
+      let done = 0;
+      const needsDeep = filter.pset.trim().length > 0;
+
+      for (const { model, ids } of modelInfos) {
+        const data = await model.getItemsData(ids, { attributesDefault: true });
+        const deepData = needsDeep ? new Array<unknown>(ids.length) : null;
+
+        if (needsDeep && deepData) {
+          const batchSize = 24;
+          for (let start = 0; start < ids.length; start += batchSize) {
+            const end = Math.min(start + batchSize, ids.length);
+            const batch = await Promise.all(
+              ids.slice(start, end).map((lid) => model.getItem(lid).getData())
+            );
+            for (let i = start; i < end; i++) deepData[i] = batch[i - start];
+            if (start > 0 && start % (batchSize * 6) === 0) await this.yieldToMainThread();
+          }
+        }
+
+        const matched = new Set<number>();
+        for (let i = 0; i < ids.length; i++) {
+          const lid = ids[i];
+          const source = deepData ? deepData[i] : data[i];
+          const values = this.collectFilterValues(source, filter.pset, filter.property);
+          const ok = values.some((v) => compareByOperator(v, filter.operator, filter.value));
+          if (ok) matched.add(lid);
+
+          done += 1;
+          if (done % 150 === 0 || done === total) {
+            useViewerStore.getState().setLoading({
+              active: true,
+              label: "Applying property filter...",
+              progress: total === 0 ? 1 : done / total,
+            });
+            await this.yieldToMainThread();
+          }
+        }
+
+        matches[model.modelId] = matched;
+        nonMatches[model.modelId] = new Set(ids.filter((id) => !matched.has(id)));
+      }
+
+      // Clear previous colorization first.
+      for (const model of this.fragments.list.values()) {
+        await model.resetColor(undefined);
+      }
+
+      if (filter.mode === "show") {
+        this.filteredOut = nonMatches;
+        await this.applyVisibilityFromState();
+      } else {
+        this.filteredOut = emptyModelIdMap();
+        await this.applyVisibilityFromState();
+        for (const model of this.fragments.list.values()) {
+          const ids = matches[model.modelId] ? [...matches[model.modelId]] : [];
+          if (ids.length === 0) continue;
+          await model.setColor(ids, new THREE.Color("#f97316"));
+        }
+      }
+
+      const matchCount = countModelIdMap(matches);
+      useViewerStore.getState().setPropertyFilter({ active: true });
+      this.noteHistory(
+        "filter",
+        "Property filter applied",
+        `${matchCount} match(es) with ${filter.mode === "show" ? "show-only" : "colorize"} mode.`
+      );
+      toast("Filter applied", { description: `${matchCount} matching element(s).` });
+    } finally {
+      useViewerStore.getState().setLoading({ active: false, label: "", progress: 1 });
+    }
+  }
+
+  async clearPropertyFilter() {
+    this.filteredOut = emptyModelIdMap();
+    useViewerStore.getState().resetPropertyFilter();
+    for (const model of this.fragments.list.values()) {
+      await model.resetColor(undefined);
+    }
+    await this.applyVisibilityFromState();
+    this.noteHistory("filter", "Property filter cleared");
+  }
+
+  exportPropertyFilterJson() {
+    const filter = useViewerStore.getState().propertyFilter;
+    return JSON.stringify(
+      {
+        pset: filter.pset,
+        property: filter.property,
+        operator: filter.operator,
+        value: filter.value,
+        mode: filter.mode,
+      },
+      null,
+      2
+    );
+  }
+
+  async importPropertyFilterJson(raw: string) {
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Invalid filter JSON: ${msg}`);
+    }
+
+    if (!isRecord(parsed)) throw new Error("Invalid filter JSON payload.");
+
+    const next: Partial<ViewerPropertyFilterState> = {};
+    if (typeof parsed.pset === "string") next.pset = parsed.pset;
+    if (typeof parsed.property === "string") next.property = parsed.property;
+    if (
+      parsed.operator === "contains" ||
+      parsed.operator === "equals" ||
+      parsed.operator === "not_equals" ||
+      parsed.operator === "gt" ||
+      parsed.operator === "lt" ||
+      parsed.operator === "gte" ||
+      parsed.operator === "lte"
+    ) {
+      next.operator = parsed.operator;
+    }
+    if (typeof parsed.value === "string") next.value = parsed.value;
+    if (parsed.mode === "show" || parsed.mode === "colorize") next.mode = parsed.mode;
+
+    useViewerStore.getState().setPropertyFilter(next);
+    this.noteHistory("filter", "Property filter imported");
+  }
+
+  private async applyCutFromState() {
+    const cut = useViewerStore.getState().cut;
+    if (!cut.enabled) {
+      this.cutHidden = emptyModelIdMap();
+      await this.applyVisibilityFromState();
+      return;
+    }
+
+    const hidden: ModelIdMap = emptyModelIdMap();
+    const ignored = new Set(cut.ignoredClasses);
+    let processedInSlice = 0;
+    let sliceStart = performance.now();
+
+    for (const [modelId, samples] of this.itemCutSamplesByModel) {
+      let target = hidden[modelId];
+      if (!target) {
+        target = new Set<number>();
+        hidden[modelId] = target;
+      }
+
+      for (const sample of samples) {
+        const classId = sample.classId;
+        if (classId && ignored.has(classId)) continue;
+
+        const axisValue = cut.orientation === "horizontal" ? sample.sampleZ : sample.sampleX;
+        const shouldHide = cut.flip ? axisValue > cut.offset : axisValue < cut.offset;
+        if (shouldHide) target.add(sample.localId);
+
+        processedInSlice += 1;
+        if (processedInSlice >= 1400) {
+          if (performance.now() - sliceStart > 10) {
+            await this.yieldToMainThread();
+            sliceStart = performance.now();
+          }
+          processedInSlice = 0;
+        }
+      }
+
+      if (target.size === 0) {
+        delete hidden[modelId];
+      }
+    }
+
+    this.cutHidden = hidden;
+    await this.applyVisibilityFromState();
+  }
+
+  private async captureRevisionSnapshot(
+    model: FRAGS.FragmentsModel,
+    modelName: string
+  ): Promise<Map<string, { name: string; tag: string; category: string; modelName: string }>> {
+    const out = new Map<string, { name: string; tag: string; category: string; modelName: string }>();
+    const ids = await model.getItemsIdsWithGeometry();
+    if (ids.length === 0) return out;
+
+    const [guids, data] = await Promise.all([
+      model.getGuidsByLocalIds(ids),
+      model.getItemsData(ids, { attributesDefault: true }),
+    ]);
+
+    for (let i = 0; i < ids.length; i++) {
+      const guid = guids[i];
+      if (!guid) continue;
+      const d = data[i];
+      out.set(guid, {
+        name: getAttr(d, "Name") ?? "",
+        tag: getAttr(d, "Tag") ?? "",
+        category: getAttr(d, "ObjectType") ?? "",
+        modelName,
+      });
+    }
+    return out;
+  }
+
+  private compareRevisionSnapshots(
+    prev: Map<string, { name: string; tag: string; category: string; modelName: string }> | null,
+    curr: Map<string, { name: string; tag: string; category: string; modelName: string }>
+  ) {
+    if (!prev) {
+      this.noteHistory("revision", "Revision baseline created", `${curr.size} GUID(s) captured.`);
+      return;
+    }
+
+    let unchanged = 0;
+    let changed = 0;
+    let added = 0;
+    let removed = 0;
+    const changedGuids: string[] = [];
+
+    for (const [guid, now] of curr) {
+      const old = prev.get(guid);
+      if (!old) {
+        added += 1;
+        continue;
+      }
+      const same = old.name === now.name && old.tag === now.tag && old.category === now.category;
+      if (same) unchanged += 1;
+      else {
+        changed += 1;
+        if (changedGuids.length < 25) changedGuids.push(guid);
+      }
+    }
+
+    for (const guid of prev.keys()) {
+      if (!curr.has(guid)) removed += 1;
+    }
+
+    const summary = `unchanged ${unchanged}, changed ${changed}, added ${added}, removed ${removed}`;
+    this.noteHistory("revision", "Revision compared", summary);
+    if (changedGuids.length > 0) {
+      this.noteHistory("revision", "Changed GUID sample", changedGuids.join(", "));
+    }
+    toast("Revision comparison", { description: summary });
+  }
+
+  getNavigationHints() {
+    return "L-click select, R-drag orbit, M-drag pan, Wheel zoom";
   }
 
   async reset() {
-    // Keep this a "single-click safety reset" like BIM tools.
     await this.setActiveTool("select");
     await this.hider.set(true);
     this.manualHidden = emptyModelIdMap();
+    this.appliedHidden = emptyModelIdMap();
+    this.visibilityForceFullApply = false;
+    this.cutHidden = emptyModelIdMap();
+    this.filteredOut = emptyModelIdMap();
     this.isolateActive = false;
     this.hiddenBeforeIsolateRaw = null;
     useViewerStore.getState().resetFilters();
+    useViewerStore.getState().resetPropertyFilter();
+    useViewerStore.getState().setCoordinates(null);
+    useViewerStore.getState().setCut({
+      enabled: false,
+      flip: false,
+      ignoredClasses: [],
+    });
+    for (const model of this.fragments.list.values()) {
+      await model.resetColor(undefined);
+    }
 
     this.setSectionInvert(false);
-    this.setSectionMode("box");
     this.setSectionEnabled(false);
+    this.setSectionLockRotation(false);
+    this.setSectionTransformMode("translate");
     this.section.setBoxEditing(false);
     this.resetSectionBox();
 
@@ -1368,6 +2198,7 @@ export class ViewerApp {
     await this.frameModel();
 
     toast("Reset", { description: "Viewer state reset." });
+    this.noteHistory("tool", "Viewer reset", "Tools, visibility, section, cut and filters reset.");
   }
 
   async updateProperties(key: ViewerSelectionKey) {
@@ -1419,6 +2250,12 @@ export class ViewerApp {
       psets: finalPsets,
       attributes,
     });
+    useViewerStore.getState().setRightPanelTab("properties");
+    this.noteHistory(
+      "properties",
+      "Properties inspected",
+      `${guid ?? `Local ${key.localId}`} (${category ?? "Unknown class"})`
+    );
   }
 
   async search(query: string) {

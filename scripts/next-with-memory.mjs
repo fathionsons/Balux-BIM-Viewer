@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { createRequire } from "node:module";
 
@@ -35,6 +37,29 @@ function buildNodeOptions(existing, extraArgs) {
   return `${out} ${suffix}`;
 }
 
+function resolveNextBin() {
+  try {
+    const pkgPath = require.resolve("next/package.json");
+    const pkgDir = path.dirname(pkgPath);
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const relBin =
+      typeof pkg.bin === "string"
+        ? pkg.bin
+        : pkg.bin && typeof pkg.bin.next === "string"
+          ? pkg.bin.next
+          : null;
+    if (relBin) return path.join(pkgDir, relBin);
+  } catch {
+    // fallback below
+  }
+
+  try {
+    return require.resolve("next/dist/bin/next");
+  } catch {
+    return require.resolve("next/dist/bin/next.js");
+  }
+}
+
 const nextArgs = process.argv.slice(2);
 if (nextArgs.length === 0) {
   console.error(
@@ -57,7 +82,18 @@ const memoryNodeOptions = [
   `--max-semi-space-size=${maxSemiSpaceSizeMB}`,
 ];
 
-const nextBin = require.resolve("next/dist/bin/next");
+let nextBin;
+try {
+  nextBin = resolveNextBin();
+} catch (err) {
+  const reason = err instanceof Error ? err.message : String(err);
+  console.error(
+    "[next-with-memory] Failed to resolve Next.js binary.\n" +
+      "Install dependencies first (`npm install`) and retry.\n" +
+      `Resolver error: ${reason}`
+  );
+  process.exit(1);
+}
 
 const env = { ...process.env };
 env.NODE_OPTIONS = buildNodeOptions(env.NODE_OPTIONS, memoryNodeOptions);

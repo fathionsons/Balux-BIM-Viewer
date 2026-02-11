@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { FolderOpen, Home, RotateCcw, Upload } from "lucide-react";
+import { FolderOpen, RotateCcw, Upload } from "lucide-react";
 import { toast } from "sonner";
 
 import { useViewer } from "../viewer/ViewerProvider";
@@ -18,6 +18,7 @@ export function TopBar() {
   const modelName = useViewerStore((s) => s.modelName);
 
   const fileRef = React.useRef<HTMLInputElement | null>(null);
+
   const toErrorMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
   const runSafe = async (title: string, fn: () => Promise<void>) => {
@@ -52,23 +53,33 @@ export function TopBar() {
     const file = ev.target.files?.[0];
     ev.target.value = "";
     if (!file || !viewer) return;
-    await runSafe("Failed to load IFC", async () => {
+    const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+    const typeLabel = ext === "glb" ? "GLB" : ext === "ifc" ? "IFC" : "model";
+    await runSafe(`Failed to load ${typeLabel}`, async () => {
       const buffer = await file.arrayBuffer();
-      await viewer.loadIfcFromBuffer(buffer, file.name);
+      if (ext === "ifc") {
+        await viewer.loadIfcFromBuffer(buffer, file.name);
+        return;
+      }
+      if (ext === "glb") {
+        await viewer.loadGlbFromBuffer(buffer, file.name);
+        return;
+      }
+      throw new Error("Unsupported file. Please choose an .ifc or .glb file.");
     });
   };
 
-  const loadSample = async () => {
+  const loadSampleIfc = async () => {
     if (!viewer) return;
-    await loadFromCandidates(["/sample.ifc", "/models/sample.ifc"], async (url) => {
+    await loadFromCandidates(["/models/sample.ifc", "/sample.ifc"], async (url) => {
       await viewer.loadIfcFromUrl(url, "sample.ifc");
     });
   };
 
-  const loadHouseGlb = async () => {
+  const loadSampleGlb = async () => {
     if (!viewer) return;
-    await loadFromCandidates(["/house.glb", "/models/house.glb"], async (url) => {
-      await viewer.loadGlbFromUrl(url, "house.glb");
+    await loadFromCandidates(["/house.glb", "/models/house.glb", "/models/sample.glb"], async (url) => {
+      await viewer.loadGlbFromUrl(url, url.split("/").pop() ?? "sample.glb");
     });
   };
 
@@ -82,7 +93,7 @@ export function TopBar() {
       <div className="flex items-center gap-3">
         <div className="flex items-baseline gap-2">
           <div className="text-sm font-semibold tracking-tight text-slate-900">
-            BALUX — BIM Viewer (Web) by Fathi
+            BALUX BIM Viewer
           </div>
           <div className="text-xs text-slate-500">
             {modelName ? `Model: ${modelName}` : "No model loaded"}
@@ -92,9 +103,9 @@ export function TopBar() {
         <Tabs value={topTab} onValueChange={(v) => setTopTab(v as ViewerTopTab)}>
           <TabsList className="bg-slate-100">
             <TabsTrigger value="viewer">BIM Viewer</TabsTrigger>
-            <TabsTrigger value="info">Info</TabsTrigger>
-            <TabsTrigger value="site">Site</TabsTrigger>
-            <TabsTrigger value="fm">FM</TabsTrigger>
+            <TabsTrigger value="info">Informationsstyring</TabsTrigger>
+            <TabsTrigger value="site">Byggepladsledelse</TabsTrigger>
+            <TabsTrigger value="fm">Facility Management</TabsTrigger>
           </TabsList>
         </Tabs>
       </div>
@@ -104,7 +115,7 @@ export function TopBar() {
           <input
             ref={fileRef}
             type="file"
-            accept=".ifc"
+            accept=".ifc,.glb"
             className="hidden"
             onChange={onFileSelected}
           />
@@ -114,14 +125,14 @@ export function TopBar() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => void runSafe("Failed to load sample IFC", loadSample)}
+                onClick={() => void runSafe("Failed to load sample IFC", loadSampleIfc)}
                 disabled={!viewer}
               >
                 <Upload className="h-4 w-4" />
-                Load sample
+                Load sample IFC
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Load `/public/sample.ifc` (fallback: `/public/models/sample.ifc`)</TooltipContent>
+            <TooltipContent>Loads `/public/models/sample.ifc`</TooltipContent>
           </Tooltip>
 
           <Tooltip>
@@ -129,27 +140,24 @@ export function TopBar() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => void runSafe("Failed to load house GLB", loadHouseGlb)}
+                onClick={() => void runSafe("Failed to load sample GLB", loadSampleGlb)}
                 disabled={!viewer}
               >
-                <Home className="h-4 w-4" />
-                Load house visual (GLB)
+                <Upload className="h-4 w-4" />
+                Load sample GLB
               </Button>
             </TooltipTrigger>
-            <TooltipContent>
-              Visual-only model: no BIM properties/tree/filters. Source: `/public/house.glb`
-              (fallback: `/public/models/house.glb`)
-            </TooltipContent>
+            <TooltipContent>Loads `/public/house.glb`</TooltipContent>
           </Tooltip>
 
           <Tooltip>
             <TooltipTrigger asChild>
               <Button variant="outline" size="sm" onClick={onPickFile} disabled={!viewer}>
                 <FolderOpen className="h-4 w-4" />
-                Open IFC...
+                Open IFC/GLB...
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Load a local IFC file</TooltipContent>
+            <TooltipContent>Load a local `.ifc` or `.glb` file</TooltipContent>
           </Tooltip>
 
           <Tooltip>
@@ -161,13 +169,14 @@ export function TopBar() {
                 disabled={!viewer}
               >
                 <RotateCcw className="h-4 w-4" />
-                Reset
+                Reset View
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Reset view, tools, section, filters</TooltipContent>
+            <TooltipContent>Reset view, tools, section, cut, filters</TooltipContent>
           </Tooltip>
         </div>
       </TooltipProvider>
     </div>
   );
 }
+

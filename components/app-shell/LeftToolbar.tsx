@@ -6,9 +6,10 @@ import {
   EyeOff,
   Focus,
   MousePointer2,
+  Palette,
   Ruler,
   RotateCcw,
-  Undo2,
+  Slice,
 } from "lucide-react";
 
 import { useViewer } from "../viewer/ViewerProvider";
@@ -25,11 +26,15 @@ import { cn } from "../../lib/utils";
 export function LeftToolbar() {
   const { viewer } = useViewer();
   const activeTool = useViewerStore((s) => s.activeTool);
+  const setRightPanelTab = useViewerStore((s) => s.setRightPanelTab);
+  const isTouchDevice = useViewerStore((s) => s.isTouchDevice);
 
-  const setTool = async (tool: "select" | "measure" | "section") => {
+  const setTool = async (tool: "select" | "measure" | "cut" | "section") => {
     if (!viewer) return;
     await viewer.setActiveTool(tool);
   };
+
+  const advancedMsg = "Advanced tools available on desktop";
 
   return (
     <TooltipProvider delayDuration={200}>
@@ -38,24 +43,38 @@ export function LeftToolbar() {
           <ToolButton
             active={activeTool === "select"}
             icon={<MousePointer2 className="h-4 w-4" />}
-            label="Select (Esc)"
+            label="Select (Q)"
             onClick={() => setTool("select")}
           />
           <ToolButton
             active={activeTool === "measure"}
             icon={<Ruler className="h-4 w-4" />}
-            label="Measure"
+            label="Measure 3D (M)"
             onClick={() => setTool("measure")}
+          />
+          <ToolButton
+            active={activeTool === "cut"}
+            icon={<Slice className="h-4 w-4" />}
+            label={isTouchDevice ? `${advancedMsg}` : "Cut plane (C) • drag in model"}
+            onClick={() => setTool("cut")}
+            disabled={isTouchDevice}
           />
           <ToolButton
             active={activeTool === "section"}
             icon={<Box className="h-4 w-4" />}
-            label="Section Box"
+            label={isTouchDevice ? `${advancedMsg}` : "Section view (B)"}
             onClick={() => setTool("section")}
+            disabled={isTouchDevice}
           />
 
           <div className="my-2 h-px bg-slate-200" />
 
+          <ToolButton
+            active={false}
+            icon={<Palette className="h-4 w-4" />}
+            label="Filters / Colorize"
+            onClick={() => setRightPanelTab("filters")}
+          />
           <ToolButton
             active={false}
             icon={<EyeOff className="h-4 w-4" />}
@@ -70,14 +89,8 @@ export function LeftToolbar() {
           />
           <ToolButton
             active={false}
-            icon={<Undo2 className="h-4 w-4" />}
-            label="Unhide all (Alt+H)"
-            onClick={() => viewer?.unhideAll()}
-          />
-          <ToolButton
-            active={false}
             icon={<RotateCcw className="h-4 w-4" />}
-            label="Reset viewer"
+            label="Reset view"
             onClick={() => viewer?.reset()}
           />
         </div>
@@ -91,28 +104,34 @@ function ToolButton({
   icon,
   label,
   onClick,
+  disabled,
 }: {
   active: boolean;
   icon: React.ReactNode;
   label: string;
   onClick: () => void;
+  disabled?: boolean;
 }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          className={cn(
-            "h-9 w-9 rounded-xl text-slate-700 hover:bg-slate-100",
-            active && "bg-slate-900 text-white hover:bg-slate-900"
-          )}
-          onClick={onClick}
-        >
-          {icon}
-        </Button>
+        <span>
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled={disabled}
+            className={cn(
+              "h-9 w-9 rounded-xl text-slate-700 hover:bg-slate-100",
+              active && "bg-slate-900 text-white hover:bg-slate-900"
+            )}
+            onClick={onClick}
+          >
+            {icon}
+          </Button>
+        </span>
       </TooltipTrigger>
       <TooltipContent side="right">{label}</TooltipContent>
     </Tooltip>
   );
 }
+

@@ -1,8 +1,10 @@
-import { create } from "zustand";
+﻿import { create } from "zustand";
 
 export type ViewerTopTab = "viewer" | "info" | "site" | "fm";
 
-export type ViewerToolId = "select" | "measure" | "section";
+export type ViewerToolId = "select" | "measure" | "cut" | "section";
+
+export type ViewerRightPanelTab = "properties" | "filters" | "history";
 
 export type RawModelIdMap = Record<string, number[]>;
 
@@ -15,18 +17,17 @@ export type PropertiesPayload = {
   category: string | null;
   name: string | null;
   tag: string | null;
-  /** A structured, UI-ready slice of item data (psets + attributes) */
   psets: Array<{
     name: string;
     props: Array<{ name: string; value: string }>;
   }>;
-  /** Raw attributes (simple key/value) for quick debug */
   attributes: Array<{ name: string; value: string }>;
 };
 
 export type ViewerStats = {
   fps: number;
   triangles: number;
+  drawCalls: number;
 };
 
 export type ViewerLoadingState = {
@@ -47,28 +48,78 @@ export type ViewerStoreyGroup = {
   count: number;
 };
 
+export type ViewerMeasurementMode = "point" | "laser" | "shortest" | "coords";
+
 export type ViewerMeasurement = {
   id: string;
+  kind: "distance";
+  mode: Exclude<ViewerMeasurementMode, "coords">;
   start: [number, number, number];
   end: [number, number, number];
   meters: number;
+  note?: string;
 };
 
 export type ViewerSectionState = {
   enabled: boolean;
-  mode: "box" | "plane";
   invert: boolean;
-  plane: {
-    axis: "x" | "y" | "z";
-    offset: number;
-    min: number;
-    max: number;
-  };
+  transformMode: "translate" | "rotate" | "scale";
+  lockRotation: boolean;
+};
+
+export type ViewerCutState = {
+  enabled: boolean;
+  orientation: "horizontal" | "vertical";
+  flip: boolean;
+  offset: number;
+  min: number;
+  max: number;
+  ignoredClasses: string[];
+};
+
+export type ViewerFilterOperator =
+  | "contains"
+  | "equals"
+  | "not_equals"
+  | "gt"
+  | "lt"
+  | "gte"
+  | "lte";
+
+export type ViewerPropertyFilterState = {
+  pset: string;
+  property: string;
+  operator: ViewerFilterOperator;
+  value: string;
+  mode: "show" | "colorize";
+  active: boolean;
+};
+
+export type ViewerHistoryEvent = {
+  id: string;
+  ts: number;
+  type:
+    | "selection"
+    | "visibility"
+    | "properties"
+    | "measurement"
+    | "filter"
+    | "revision"
+    | "tool"
+    | "load";
+  title: string;
+  details?: string;
 };
 
 export type ViewerStore = {
   topTab: ViewerTopTab;
   setTopTab: (tab: ViewerTopTab) => void;
+
+  rightPanelTab: ViewerRightPanelTab;
+  setRightPanelTab: (tab: ViewerRightPanelTab) => void;
+
+  isTouchDevice: boolean;
+  setIsTouchDevice: (value: boolean) => void;
 
   activeTool: ViewerToolId;
   setActiveTool: (tool: ViewerToolId) => void;
@@ -101,19 +152,47 @@ export type ViewerStore = {
   setStoreyVisibility: (id: string, visible: boolean) => void;
   resetFilters: () => void;
 
+  measurementMode: ViewerMeasurementMode;
+  setMeasurementMode: (mode: ViewerMeasurementMode) => void;
   measurements: ViewerMeasurement[];
   setMeasurements: (items: ViewerMeasurement[]) => void;
   removeMeasurement: (id: string) => void;
   clearMeasurements: () => void;
+  coordinates: { x: number; y: number; z: number } | null;
+  setCoordinates: (coords: { x: number; y: number; z: number } | null) => void;
 
   section: ViewerSectionState;
   setSection: (next: Partial<ViewerSectionState>) => void;
-  setSectionPlane: (next: Partial<ViewerSectionState["plane"]>) => void;
+
+  cut: ViewerCutState;
+  setCut: (next: Partial<ViewerCutState>) => void;
+  setCutIgnoredClass: (classId: string, ignored: boolean) => void;
+
+  propertyFilter: ViewerPropertyFilterState;
+  setPropertyFilter: (next: Partial<ViewerPropertyFilterState>) => void;
+  resetPropertyFilter: () => void;
+
+  history: ViewerHistoryEvent[];
+  pushHistory: (event: Omit<ViewerHistoryEvent, "id" | "ts">) => void;
+  clearHistory: () => void;
 };
+
+function buildVisibilityMap<T extends { id: string }>(groups: T[]) {
+  return groups.reduce<Record<string, boolean>>((acc, g) => {
+    acc[g.id] = true;
+    return acc;
+  }, {});
+}
 
 export const useViewerStore = create<ViewerStore>((set, get) => ({
   topTab: "viewer",
   setTopTab: (tab) => set({ topTab: tab }),
+
+  rightPanelTab: "properties",
+  setRightPanelTab: (tab) => set({ rightPanelTab: tab }),
+
+  isTouchDevice: false,
+  setIsTouchDevice: (value) => set({ isTouchDevice: value }),
 
   activeTool: "select",
   setActiveTool: (tool) => set({ activeTool: tool }),
@@ -124,7 +203,7 @@ export const useViewerStore = create<ViewerStore>((set, get) => ({
       loading: { ...s.loading, ...state },
     })),
 
-  stats: { fps: 0, triangles: 0 },
+  stats: { fps: 0, triangles: 0, drawCalls: 0 },
   setStats: (stats) => set((s) => ({ stats: { ...s.stats, ...stats } })),
 
   modelName: null,
@@ -150,18 +229,12 @@ export const useViewerStore = create<ViewerStore>((set, get) => ({
   setClassGroups: (groups) =>
     set({
       classGroups: groups,
-      classVisibility: groups.reduce<Record<string, boolean>>((acc, g) => {
-        acc[g.id] = true;
-        return acc;
-      }, {}),
+      classVisibility: buildVisibilityMap(groups),
     }),
   setStoreyGroups: (groups) =>
     set({
       storeyGroups: groups,
-      storeyVisibility: groups.reduce<Record<string, boolean>>((acc, g) => {
-        acc[g.id] = true;
-        return acc;
-      }, {}),
+      storeyVisibility: buildVisibilityMap(groups),
     }),
   setClassVisibility: (id, visible) =>
     set((s) => ({ classVisibility: { ...s.classVisibility, [id]: visible } })),
@@ -170,33 +243,81 @@ export const useViewerStore = create<ViewerStore>((set, get) => ({
   resetFilters: () => {
     const { classGroups, storeyGroups } = get();
     set({
-      classVisibility: classGroups.reduce<Record<string, boolean>>((acc, g) => {
-        acc[g.id] = true;
-        return acc;
-      }, {}),
-      storeyVisibility: storeyGroups.reduce<Record<string, boolean>>((acc, g) => {
-        acc[g.id] = true;
-        return acc;
-      }, {}),
+      classVisibility: buildVisibilityMap(classGroups),
+      storeyVisibility: buildVisibilityMap(storeyGroups),
     });
   },
 
+  measurementMode: "point",
+  setMeasurementMode: (mode) => set({ measurementMode: mode }),
   measurements: [],
   setMeasurements: (items) => set({ measurements: items }),
   removeMeasurement: (id) =>
     set((s) => ({ measurements: s.measurements.filter((m) => m.id !== id) })),
   clearMeasurements: () => set({ measurements: [] }),
+  coordinates: null,
+  setCoordinates: (coords) => set({ coordinates: coords }),
 
   section: {
     enabled: false,
-    mode: "box",
     invert: false,
-    plane: { axis: "z", offset: 0, min: -1, max: 1 },
+    transformMode: "translate",
+    lockRotation: false,
   },
   setSection: (next) => set((s) => ({ section: { ...s.section, ...next } })),
-  setSectionPlane: (next) =>
+
+  cut: {
+    enabled: false,
+    orientation: "horizontal",
+    flip: false,
+    offset: 0,
+    min: -1,
+    max: 1,
+    ignoredClasses: [],
+  },
+  setCut: (next) => set((s) => ({ cut: { ...s.cut, ...next } })),
+  setCutIgnoredClass: (classId, ignored) =>
+    set((s) => {
+      const list = new Set(s.cut.ignoredClasses);
+      if (ignored) list.add(classId);
+      else list.delete(classId);
+      return { cut: { ...s.cut, ignoredClasses: [...list].sort() } };
+    }),
+
+  propertyFilter: {
+    pset: "",
+    property: "",
+    operator: "contains",
+    value: "",
+    mode: "show",
+    active: false,
+  },
+  setPropertyFilter: (next) =>
+    set((s) => ({ propertyFilter: { ...s.propertyFilter, ...next } })),
+  resetPropertyFilter: () =>
+    set({
+      propertyFilter: {
+        pset: "",
+        property: "",
+        operator: "contains",
+        value: "",
+        mode: "show",
+        active: false,
+      },
+    }),
+
+  history: [],
+  pushHistory: (event) =>
     set((s) => ({
-      section: { ...s.section, plane: { ...s.section.plane, ...next } },
+      history: [
+        {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+          ts: Date.now(),
+          ...event,
+        },
+        ...s.history,
+      ].slice(0, 500),
     })),
+  clearHistory: () => set({ history: [] }),
 }));
 

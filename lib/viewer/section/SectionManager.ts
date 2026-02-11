@@ -38,6 +38,27 @@ export class SectionManager {
   private controls: TransformControls;
   private controlsHelper: THREE.Object3D;
   private editing = false;
+  private lockRotation = false;
+  private boxPlaneUpdateRaf = 0;
+  private readonly localPoints = [
+    new THREE.Vector3(0.5, 0, 0), // +X
+    new THREE.Vector3(-0.5, 0, 0), // -X
+    new THREE.Vector3(0, 0.5, 0), // +Y
+    new THREE.Vector3(0, -0.5, 0), // -Y
+    new THREE.Vector3(0, 0, 0.5), // +Z
+    new THREE.Vector3(0, 0, -0.5), // -Z
+  ];
+  private readonly inwardNormals = [
+    new THREE.Vector3(-1, 0, 0), // +X face
+    new THREE.Vector3(1, 0, 0), // -X face
+    new THREE.Vector3(0, -1, 0), // +Y face
+    new THREE.Vector3(0, 1, 0), // -Y face
+    new THREE.Vector3(0, 0, -1), // +Z face
+    new THREE.Vector3(0, 0, 1), // -Z face
+  ];
+  private readonly tmpNormalMatrix = new THREE.Matrix3();
+  private readonly tmpPoint = new THREE.Vector3();
+  private readonly tmpNormal = new THREE.Vector3();
 
   // Plane mode
   private planeAxis: "x" | "y" | "z" = "z";
@@ -74,7 +95,12 @@ export class SectionManager {
       this.onDraggingChanged?.(dragging);
     });
     this.controls.addEventListener("change", () => {
-      if (this.enabled && this.mode === "box") this.updateBoxPlanes();
+      if (!this.enabled || this.mode !== "box") return;
+      if (this.lockRotation) {
+        this.box.rotation.set(0, 0, 0);
+        this.box.updateMatrixWorld(true);
+      }
+      this.queueBoxPlaneUpdate();
     });
 
     this.scene.add(this.box);
@@ -85,6 +111,8 @@ export class SectionManager {
   }
 
   dispose() {
+    if (this.boxPlaneUpdateRaf) cancelAnimationFrame(this.boxPlaneUpdateRaf);
+    this.boxPlaneUpdateRaf = 0;
     this.controls.dispose();
     this.box.removeFromParent();
     this.controlsHelper.removeFromParent();
@@ -216,7 +244,26 @@ export class SectionManager {
   }
 
   setTransformMode(mode: "translate" | "rotate" | "scale") {
+    if (this.lockRotation && mode === "rotate") {
+      this.controls.setMode("translate");
+      return;
+    }
     this.controls.setMode(mode);
+  }
+
+  setLockRotation(locked: boolean) {
+    this.lockRotation = locked;
+    if (locked) {
+      this.box.rotation.set(0, 0, 0);
+      this.box.updateMatrixWorld(true);
+      this.updateBoxPlanes();
+      this.applyToMaterials();
+      if (this.controls.mode === "rotate") this.controls.setMode("translate");
+    }
+  }
+
+  getLockRotation() {
+    return this.lockRotation;
   }
 
   private updateGizmoVisibility() {
@@ -287,40 +334,23 @@ export class SectionManager {
   }
 
   private updateBoxPlanes() {
-    // Compute 6 planes from the current box transform.
-    // We use a unit cube geometry scaled by box.scale (centered at origin).
     this.box.updateMatrixWorld(true);
     const matWorld = this.box.matrixWorld;
-
-    const half = new THREE.Vector3(0.5, 0.5, 0.5);
-    const localPoints = [
-      new THREE.Vector3(half.x, 0, 0), // +X
-      new THREE.Vector3(-half.x, 0, 0), // -X
-      new THREE.Vector3(0, half.y, 0), // +Y
-      new THREE.Vector3(0, -half.y, 0), // -Y
-      new THREE.Vector3(0, 0, half.z), // +Z
-      new THREE.Vector3(0, 0, -half.z), // -Z
-    ];
-
-    // three.js clips the "negative" side of each plane. To keep the volume inside the
-    // box by default we use inward-facing normals so the outside of the box is clipped.
-    // When invert is enabled we flip normals and switch to intersection mode (see applyToMaterials)
-    // to clip the inside of the box instead.
-    const inward = [
-      new THREE.Vector3(-1, 0, 0), // +X face
-      new THREE.Vector3(1, 0, 0), // -X face
-      new THREE.Vector3(0, -1, 0), // +Y face
-      new THREE.Vector3(0, 1, 0), // -Y face
-      new THREE.Vector3(0, 0, -1), // +Z face
-      new THREE.Vector3(0, 0, 1), // -Z face
-    ];
-    const localNormals = this.invert ? inward.map((n) => n.multiplyScalar(-1)) : inward;
-
-    const normalMatrix = new THREE.Matrix3().getNormalMatrix(matWorld);
+    const invertMul = this.invert ? -1 : 1;
+    this.tmpNormalMatrix.getNormalMatrix(matWorld);
     for (let i = 0; i < 6; i++) {
-      const pWorld = localPoints[i].clone().applyMatrix4(matWorld);
-      const nWorld = localNormals[i].clone().applyMatrix3(normalMatrix).normalize();
-      this.boxPlanes[i].setFromNormalAndCoplanarPoint(nWorld, pWorld);
+      this.tmpPoint.copy(this.localPoints[i]).applyMatrix4(matWorld);
+      this.tmpNormal.copy(this.inwardNormals[i]).multiplyScalar(invertMul);
+      this.tmpNormal.applyMatrix3(this.tmpNormalMatrix).normalize();
+      this.boxPlanes[i].setFromNormalAndCoplanarPoint(this.tmpNormal, this.tmpPoint);
     }
+  }
+
+  private queueBoxPlaneUpdate() {
+    if (this.boxPlaneUpdateRaf) return;
+    this.boxPlaneUpdateRaf = requestAnimationFrame(() => {
+      this.boxPlaneUpdateRaf = 0;
+      this.updateBoxPlanes();
+    });
   }
 }
