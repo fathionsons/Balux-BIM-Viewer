@@ -81,13 +81,22 @@ export function RightPanel({
             </TabsList>
           </div>
 
-          <TabsContent value="properties" className="mt-2 min-h-0 flex-1">
+          <TabsContent
+            value="properties"
+            className="mt-2 min-h-0 flex-1 overflow-hidden data-[state=active]:flex data-[state=active]:flex-1"
+          >
             <PropertiesTab />
           </TabsContent>
-          <TabsContent value="filters" className="mt-2 min-h-0 flex-1">
+          <TabsContent
+            value="filters"
+            className="mt-2 min-h-0 flex-1 overflow-hidden data-[state=active]:flex data-[state=active]:flex-1"
+          >
             <FiltersTab />
           </TabsContent>
-          <TabsContent value="history" className="mt-2 min-h-0 flex-1">
+          <TabsContent
+            value="history"
+            className="mt-2 min-h-0 flex-1 overflow-hidden data-[state=active]:flex data-[state=active]:flex-1"
+          >
             <HistoryTab />
           </TabsContent>
         </Tabs>

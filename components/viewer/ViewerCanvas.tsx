@@ -13,6 +13,12 @@ export function ViewerCanvas() {
   const loading = useViewerStore((s) => s.loading);
   const [initError, setInitError] = React.useState<string | null>(null);
 
+  const hasModernViewerApi = React.useCallback((app: ViewerApp | null) => {
+    if (!app) return false;
+    const anyApp = app as unknown as Record<string, unknown>;
+    return typeof anyApp.setViewMode === "function" && typeof anyApp.setViewPreset === "function";
+  }, []);
+
   React.useEffect(() => {
     let cancelled = false;
     let app: ViewerApp | null = null;
@@ -45,6 +51,47 @@ export function ViewerCanvas() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  React.useEffect(() => {
+    if (!viewer) return;
+    if (hasModernViewerApi(viewer)) return;
+
+    const el = containerRef.current;
+    if (!el) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        console.warn("[ViewerCanvas] Stale viewer API detected. Recreating viewer instance.");
+        setInitError(null);
+        useViewerStore.getState().setLoading({
+          active: true,
+          label: "Refreshing viewer runtime...",
+          progress: 0.15,
+        });
+        viewer.dispose();
+        setViewer(null);
+        const fresh = await ViewerApp.create(el);
+        if (cancelled) {
+          fresh.dispose();
+          return;
+        }
+        setViewer(fresh);
+        useViewerStore.getState().setLoading({ active: false, label: "", progress: 1 });
+        toast("Viewer refreshed", { description: "Runtime API synchronized." });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(e);
+        useViewerStore.getState().setLoading({ active: false, label: "", progress: 0 });
+        setInitError(message);
+        toast.error("Viewer refresh failed", { description: message });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [viewer, setViewer, hasModernViewerApi]);
 
   return (
     <div className="relative h-full w-full">

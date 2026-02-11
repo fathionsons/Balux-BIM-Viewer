@@ -248,6 +248,8 @@ export type ViewerRaycastHit = {
   localId?: number;
 };
 
+type ViewerViewPreset = "top" | "bottom" | "front" | "left" | "right" | "back";
+
 export class ViewerApp {
   static async create(container: HTMLElement) {
     const app = new ViewerApp(container);
@@ -279,6 +281,11 @@ export class ViewerApp {
   private glbRoot: THREE.Object3D | null = null;
   private glbBounds: THREE.Box3 | null = null;
   private glbRaycaster = new THREE.Raycaster();
+  private glbHoveredObject: THREE.Object3D | null = null;
+  private glbSelectedObject: THREE.Object3D | null = null;
+  private glbIsolateSnapshot: Map<THREE.Object3D, boolean> | null = null;
+  private readonly glbHoverHelper = new THREE.Box3Helper(new THREE.Box3(), new THREE.Color("#0ea5e9"));
+  private readonly glbSelectHelper = new THREE.Box3Helper(new THREE.Box3(), new THREE.Color("#f97316"));
 
   // Classification groups for fast filters/tree.
   private classGroupItems = new Map<string, ModelIdMap>();
@@ -319,8 +326,11 @@ export class ViewerApp {
 
   // Keep navigation above model "ground" and scale camera limits per model size.
   private cameraGroundZ: number | null = null;
+  private cameraBoundsCenter: THREE.Vector3 | null = null;
+  private cameraBoundsDiag = 1;
   private tmpCamPos = new THREE.Vector3();
   private tmpCamTarget = new THREE.Vector3();
+  private tmpCamDelta = new THREE.Vector3();
 
   // Highlighter creates its own materials; when sectioning is enabled we need to ensure
   // those materials also receive the active clipping planes.
@@ -385,7 +395,8 @@ export class ViewerApp {
     controls.azimuthRotateSpeed = 0.7;
     controls.polarRotateSpeed = 0.7;
     controls.dollyToCursor = true;
-    controls.infinityDolly = true;
+    controls.infinityDolly = false;
+    controls.boundaryFriction = 0.15;
     controls.minPolarAngle = 0.01;
     controls.maxPolarAngle = Math.PI / 2 - 0.02;
     controls.minDistance = 0.5;
@@ -436,6 +447,12 @@ export class ViewerApp {
         this.cameraComponent.enabled = !dragging;
       },
     });
+    this.glbHoverHelper.name = "GLBHoverHelper";
+    this.glbHoverHelper.visible = false;
+    this.glbSelectHelper.name = "GLBSelectHelper";
+    this.glbSelectHelper.visible = false;
+    this.scene.add(this.glbHoverHelper);
+    this.scene.add(this.glbSelectHelper);
 
     this.tools = new ToolManager(this);
     this.tools.register(new SelectTool());
@@ -518,6 +535,7 @@ export class ViewerApp {
     // Stats sampling on world's update tick.
     const cb = () => {
       this.clampCameraAboveGround();
+      this.recoverCameraIfOutOfBounds();
 
       this.statsFrames += 1;
       const now = performance.now();
@@ -579,6 +597,24 @@ export class ViewerApp {
     this.cutApplyQueued = false;
     this.cutApplyInFlight = false;
     this.disposeGlbRoot();
+    this.glbHoverHelper.removeFromParent();
+    this.glbSelectHelper.removeFromParent();
+    this.glbHoverHelper.box.makeEmpty();
+    this.glbSelectHelper.box.makeEmpty();
+    this.glbHoverHelper.geometry.dispose();
+    this.glbSelectHelper.geometry.dispose();
+    const hoverMaterial = this.glbHoverHelper.material;
+    if (Array.isArray(hoverMaterial)) {
+      for (const m of hoverMaterial) m.dispose();
+    } else {
+      hoverMaterial.dispose();
+    }
+    const selectMaterial = this.glbSelectHelper.material;
+    if (Array.isArray(selectMaterial)) {
+      for (const m of selectMaterial) m.dispose();
+    } else {
+      selectMaterial.dispose();
+    }
     this.section.dispose();
     this.measurements.dispose();
     this.bvh.dispose();
@@ -621,9 +657,18 @@ export class ViewerApp {
         await this.frameSelection();
         return;
       }
+      if (this.glbHoveredObject) {
+        this.setGlbSelectedObject(this.glbHoveredObject, { updateProperties: true, noteHistory: true });
+        await this.frameGlbObject(this.glbHoveredObject);
+        return;
+      }
       const sel = useViewerStore.getState().selection;
       if (Object.keys(sel).length > 0) {
         await this.frameSelection();
+        return;
+      }
+      if (this.glbSelectedObject) {
+        await this.frameGlbObject(this.glbSelectedObject);
         return;
       }
       await this.frameModel();
@@ -659,7 +704,50 @@ export class ViewerApp {
     }
 
     if (key === "f") {
-      void this.frameSelection();
+      const sel = useViewerStore.getState().selection;
+      if (Object.keys(sel).length > 0 || this.glbSelectedObject) void this.frameSelection();
+      else void this.frameModel();
+      ev.preventDefault();
+      return;
+    }
+
+    if (key === "1") {
+      void this.setViewMode("3d");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "2") {
+      void this.setViewMode("2d");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "3") {
+      void this.setViewPreset("top");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "4") {
+      void this.setViewPreset("front");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "5") {
+      void this.setViewPreset("left");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "6") {
+      void this.setViewPreset("right");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "7") {
+      void this.setViewPreset("back");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "8") {
+      void this.setViewPreset("bottom");
       ev.preventDefault();
       return;
     }
@@ -827,6 +915,13 @@ export class ViewerApp {
     root.removeFromParent();
     this.glbRoot = null;
     this.glbBounds = null;
+    this.glbHoveredObject = null;
+    this.glbSelectedObject = null;
+    this.glbIsolateSnapshot = null;
+    this.glbHoverHelper.visible = false;
+    this.glbSelectHelper.visible = false;
+    this.glbHoverHelper.box.makeEmpty();
+    this.glbSelectHelper.box.makeEmpty();
 
     for (const g of geometries) g.dispose();
     for (const t of textures) t.dispose();
@@ -899,31 +994,42 @@ export class ViewerApp {
     };
   }
 
-  private updateCameraBoundsFromBox(box: THREE.Box3) {
+  private updateCameraBoundsFromBox(box: THREE.Box3, opts?: { syncCut?: boolean }) {
     const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
     box.getSize(size);
+    box.getCenter(center);
     const diag = Math.max(size.length(), 1);
 
     this.cameraGroundZ = box.min.z + Math.max(0.02, size.z * 0.01);
+    this.cameraBoundsCenter = center;
+    this.cameraBoundsDiag = diag;
 
     const controls = this.cameraComponent.controls;
     controls.minDistance = Math.max(0.2, diag * 0.01);
     controls.maxDistance = Math.max(200, diag * 20);
+    controls.setBoundary(box.clone().expandByScalar(diag * 4));
 
     const cam = this.cameraComponent.three;
     if (cam instanceof THREE.PerspectiveCamera) {
       cam.near = Math.max(0.01, diag * 0.001);
       cam.far = Math.max(100, diag * 50);
       cam.updateProjectionMatrix();
+    } else if (cam instanceof THREE.OrthographicCamera) {
+      cam.near = Math.max(0.01, diag * 0.001);
+      cam.far = Math.max(100, diag * 50);
+      cam.updateProjectionMatrix();
     }
 
-    this.cutBounds = {
-      xMin: box.min.x,
-      xMax: box.max.x,
-      zMin: box.min.z,
-      zMax: box.max.z,
-    };
-    this.syncCutRangeForOrientation(useViewerStore.getState().cut.orientation, { center: true });
+    if (opts?.syncCut !== false) {
+      this.cutBounds = {
+        xMin: box.min.x,
+        xMax: box.max.x,
+        zMin: box.min.z,
+        zMax: box.max.z,
+      };
+      this.syncCutRangeForOrientation(useViewerStore.getState().cut.orientation, { center: true });
+    }
   }
 
   private clampCameraAboveGround() {
@@ -940,6 +1046,48 @@ export class ViewerApp {
     }
     if (target.z < this.cameraGroundZ) {
       target.z = this.cameraGroundZ;
+      changed = true;
+    }
+
+    if (changed) {
+      void controls.setLookAt(pos.x, pos.y, pos.z, target.x, target.y, target.z, false);
+    }
+  }
+
+  private isFiniteVector(v: THREE.Vector3) {
+    return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+  }
+
+  private recoverCameraIfOutOfBounds() {
+    const center = this.cameraBoundsCenter;
+    if (!center) return;
+
+    const controls = this.cameraComponent.controls;
+    const pos = controls.getPosition(this.tmpCamPos);
+    const target = controls.getTarget(this.tmpCamTarget);
+
+    if (!this.isFiniteVector(pos) || !this.isFiniteVector(target)) {
+      const dist = Math.max(this.cameraBoundsDiag * 1.4, 3);
+      const dir = this.tmpCamDelta.set(1, -1, 0.75).normalize();
+      const nextPos = center.clone().addScaledVector(dir, dist);
+      void controls.setLookAt(nextPos.x, nextPos.y, nextPos.z, center.x, center.y, center.z, false);
+      return;
+    }
+
+    let changed = false;
+    const maxTargetDrift = Math.max(this.cameraBoundsDiag * 8, 20);
+    if (target.distanceTo(center) > maxTargetDrift) {
+      target.lerp(center, 0.65);
+      changed = true;
+    }
+
+    const cameraDistance = pos.distanceTo(target);
+    const maxDistance = Math.max(this.cameraBoundsDiag * 12, controls.maxDistance * 1.2);
+    if (cameraDistance > maxDistance) {
+      const dir = this.tmpCamDelta.copy(pos).sub(target);
+      if (dir.lengthSq() < 1e-8) dir.set(1, -1, 0.75);
+      dir.normalize().multiplyScalar(Math.max(this.cameraBoundsDiag * 2.5, controls.maxDistance * 0.85));
+      pos.copy(target).add(dir);
       changed = true;
     }
 
@@ -1000,6 +1148,105 @@ export class ViewerApp {
 
   private hasIfcModels() {
     return this.fragments.list.size > 0;
+  }
+
+  private updateGlbHelper(helper: THREE.Box3Helper, object: THREE.Object3D | null) {
+    if (!object || !this.glbRoot) {
+      helper.visible = false;
+      return;
+    }
+    helper.box.setFromObject(object);
+    helper.visible = !helper.box.isEmpty();
+  }
+
+  private setGlbHoveredObject(object: THREE.Object3D | null) {
+    if (this.glbHoveredObject === object) return;
+    this.glbHoveredObject = object;
+    this.updateGlbHelper(this.glbHoverHelper, object);
+  }
+
+  private buildGlbProperties(object: THREE.Object3D): PropertiesPayload {
+    const mesh = object as THREE.Mesh;
+    const worldPos = object.getWorldPosition(new THREE.Vector3());
+    const attributes: Array<{ name: string; value: string }> = [
+      { name: "Source", value: "GLB visual model" },
+      { name: "ObjectType", value: object.type },
+      { name: "UUID", value: object.uuid },
+      {
+        name: "World Position",
+        value: `${worldPos.x.toFixed(3)}, ${worldPos.y.toFixed(3)}, ${worldPos.z.toFixed(3)}`,
+      },
+    ];
+
+    if (mesh.isMesh) {
+      const geom = mesh.geometry as THREE.BufferGeometry | undefined;
+      if (geom) {
+        const triCount =
+          geom.index != null
+            ? Math.round(geom.index.count / 3)
+            : geom.attributes.position
+              ? Math.round(geom.attributes.position.count / 3)
+              : 0;
+        attributes.push({ name: "Triangles", value: triCount.toLocaleString() });
+      }
+
+      const mat = mesh.material;
+      if (Array.isArray(mat)) {
+        const names = mat.map((m) => m?.name).filter(Boolean);
+        if (names.length > 0) attributes.push({ name: "Materials", value: names.join(", ") });
+      } else if (mat?.name) {
+        attributes.push({ name: "Material", value: mat.name });
+      }
+    }
+
+    attributes.sort((a, b) => a.name.localeCompare(b.name));
+
+    return {
+      modelId: "__glb__",
+      localId: object.id,
+      guid: null,
+      category: object.type,
+      name: object.name || `${object.type} ${object.id}`,
+      tag: null,
+      psets: [],
+      attributes,
+    };
+  }
+
+  private setGlbSelectedObject(
+    object: THREE.Object3D | null,
+    opts?: { updateProperties?: boolean; noteHistory?: boolean }
+  ) {
+    if (this.glbSelectedObject === object) return;
+    this.glbSelectedObject = object;
+    this.updateGlbHelper(this.glbSelectHelper, object);
+
+    if (opts?.updateProperties !== false) {
+      useViewerStore.getState().setProperties(object ? this.buildGlbProperties(object) : null);
+      if (object) useViewerStore.getState().setRightPanelTab("properties");
+    }
+
+    if (object && opts?.noteHistory !== false) {
+      this.noteHistory("selection", "GLB object selected", `${object.name || object.type} (#${object.id})`);
+    }
+  }
+
+  private async frameGlbObject(object: THREE.Object3D) {
+    const meshes = this.collectMeshesFromObject(object);
+    if (meshes.length === 0) {
+      await this.frameModel();
+      return;
+    }
+
+    const bounds = new THREE.Box3().setFromObject(object);
+    if (bounds.isEmpty()) {
+      await this.frameModel();
+      return;
+    }
+
+    this.updateCameraBoundsFromBox(bounds, { syncCut: false });
+    await this.fitMeshesWithFallback(meshes, 1.12, bounds);
+    this.centerCameraTargetToMeshes(meshes);
   }
 
   getCutCursor(orientation = useViewerStore.getState().cut.orientation) {
@@ -1064,6 +1311,7 @@ export class ViewerApp {
   async clearHover() {
     this.hoverRequestSerial += 1;
     useViewerStore.getState().setHovered(null);
+    this.setGlbHoveredObject(null);
     if (!this.hasHoverHighlight) return;
     if (!this.fragments.initialized || this.fragments.list.size === 0) {
       this.hasHoverHighlight = false;
@@ -1095,7 +1343,19 @@ export class ViewerApp {
 
     const prev = useViewerStore.getState().hovered;
 
-    if (!hit || hit.kind !== "ifc" || hit.modelId == null || hit.localId == null) {
+    if (!hit) {
+      if (prev || this.hasHoverHighlight) await this.clearHover();
+      return;
+    }
+
+    if (hit.kind === "glb") {
+      if (prev || this.hasHoverHighlight) await this.clearHover();
+      useViewerStore.getState().setHovered(null);
+      this.setGlbHoveredObject(hit.object);
+      return;
+    }
+
+    if (hit.modelId == null || hit.localId == null) {
       if (prev || this.hasHoverHighlight) await this.clearHover();
       return;
     }
@@ -1103,6 +1363,7 @@ export class ViewerApp {
     const key: ViewerSelectionKey = { modelId: hit.modelId, localId: hit.localId };
     if (prev && prev.modelId === key.modelId && prev.localId === key.localId) return;
 
+    this.setGlbHoveredObject(null);
     useViewerStore.getState().setHovered(key);
 
     const exclude = rawToModelIdMap(useViewerStore.getState().selection);
@@ -1114,6 +1375,7 @@ export class ViewerApp {
   }
 
   private async selectFromKey(key: ViewerSelectionKey, opts: { multi: boolean }) {
+    this.setGlbSelectedObject(null, { updateProperties: false, noteHistory: false });
     const currentRaw = useViewerStore.getState().selection;
     const raw = structuredClone(currentRaw) as RawModelIdMap;
     const list = raw[key.modelId] ?? [];
@@ -1150,10 +1412,24 @@ export class ViewerApp {
 
   async selectFromPointerEvent(ev: PointerEvent, opts: { multi: boolean }) {
     const hit = await this.raycastFromPointerEvent(ev);
-    if (!hit || hit.kind !== "ifc" || hit.modelId == null || hit.localId == null) {
+    if (!hit) {
       if (!opts.multi) await this.clearSelection();
       return;
     }
+
+    if (hit.kind === "glb") {
+      if (opts.multi) return;
+      await this.clearSelection();
+      this.setGlbSelectedObject(hit.object, { updateProperties: true, noteHistory: true });
+      this.setGlbHoveredObject(hit.object);
+      return;
+    }
+
+    if (hit.modelId == null || hit.localId == null) {
+      if (!opts.multi) await this.clearSelection();
+      return;
+    }
+
     const key: ViewerSelectionKey = { modelId: hit.modelId, localId: hit.localId };
     await this.selectFromKey(key, opts);
   }
@@ -1165,6 +1441,7 @@ export class ViewerApp {
   async clearSelection() {
     useViewerStore.getState().setSelection({}, null);
     useViewerStore.getState().setProperties(null);
+    this.setGlbSelectedObject(null, { updateProperties: false, noteHistory: false });
     if (!this.hasSelectHighlight) return;
     if (!this.fragments.initialized || this.fragments.list.size === 0) {
       this.hasSelectHighlight = false;
@@ -1190,10 +1467,25 @@ export class ViewerApp {
   }
 
   async frameSelection() {
+    if (this.glbSelectedObject) {
+      await this.frameGlbObject(this.glbSelectedObject);
+      return;
+    }
     const raw = useViewerStore.getState().selection;
     const map = rawToModelIdMap(raw);
     if (isEmptyMap(map)) return;
-    await this.cameraComponent.fitToItems(map);
+    let fitSettled = false;
+    await this.settleOrWarn(
+      this.cameraComponent.fitToItems(map).then(() => {
+        fitSettled = true;
+      }),
+      1500,
+      "camera.fitToItems",
+      { warnOnTimeout: false, warnOnReject: false }
+    );
+    if (!fitSettled) {
+      await this.frameModel();
+    }
   }
 
   private collectMeshesFromObject(root: THREE.Object3D) {
@@ -1203,6 +1495,32 @@ export class ViewerApp {
       if (mesh.isMesh) meshes.push(mesh);
     });
     return meshes;
+  }
+
+  private getCurrentModelMeshes() {
+    const meshes: THREE.Mesh[] = [];
+    if (this.fragments.list.size > 0) {
+      for (const model of this.fragments.list.values()) {
+        meshes.push(...this.collectMeshesFromObject(model.object));
+      }
+      return meshes;
+    }
+    if (this.glbRoot) {
+      meshes.push(...this.collectMeshesFromObject(this.glbRoot));
+    }
+    return meshes;
+  }
+
+  private getCurrentModelBounds() {
+    if (this.fragments.list.size > 0) {
+      const bounds = new THREE.Box3();
+      bounds.makeEmpty();
+      for (const model of this.fragments.list.values()) {
+        bounds.union(model.box);
+      }
+      return bounds.isEmpty() ? null : bounds;
+    }
+    return this.glbBounds ? this.glbBounds.clone() : null;
   }
 
   private centerCameraTargetToMeshes(meshes: THREE.Mesh[]) {
@@ -1231,20 +1549,120 @@ export class ViewerApp {
     void controls.setLookAt(nextPos.x, nextPos.y, nextPos.z, center.x, center.y, center.z, false);
   }
 
-  async frameModel() {
-    const meshes: THREE.Mesh[] = [];
+  private async fitMeshesWithFallback(meshes: THREE.Mesh[], padding: number, bounds: THREE.Box3) {
+    let fitSettled = false;
+    await this.settleOrWarn(
+      this.cameraComponent.fit(meshes, padding).then(() => {
+        fitSettled = true;
+      }),
+      1800,
+      "camera.fit",
+      { warnOnTimeout: false, warnOnReject: false }
+    );
+    if (fitSettled) return;
 
-    if (this.fragments.list.size > 0) {
-      for (const model of this.fragments.list.values()) {
-        meshes.push(...this.collectMeshesFromObject(model.object));
-      }
-    } else if (this.glbRoot) {
-      meshes.push(...this.collectMeshesFromObject(this.glbRoot));
+    const center = bounds.getCenter(new THREE.Vector3());
+    const size = bounds.getSize(new THREE.Vector3());
+    const radius = Math.max(size.length(), 1) * 1.4;
+    const dir = new THREE.Vector3(1, -1, 0.75).normalize();
+    const pos = center.clone().addScaledVector(dir, radius);
+
+    await this.settleOrWarn(
+      this.cameraComponent.controls.setLookAt(pos.x, pos.y, pos.z, center.x, center.y, center.z, false),
+      800,
+      "camera.fitFallbackLookAt",
+      { warnOnTimeout: false, warnOnReject: false }
+    );
+  }
+
+  async frameModel() {
+    const meshes = this.getCurrentModelMeshes();
+    if (meshes.length === 0) return;
+    const bounds = this.getCurrentModelBounds();
+    if (bounds) {
+      this.updateCameraBoundsFromBox(bounds, { syncCut: false });
+      await this.fitMeshesWithFallback(meshes, 1.15, bounds);
+    } else {
+      await this.cameraComponent.fit(meshes, 1.15);
+    }
+    this.centerCameraTargetToMeshes(meshes);
+  }
+
+  async setViewMode(mode: "3d" | "2d") {
+    const meshes = this.getCurrentModelMeshes();
+    if (meshes.length === 0) return;
+
+    if (mode === "3d") {
+      await this.cameraComponent.projection.set("Perspective");
+      const bounds = this.getCurrentModelBounds();
+      if (!bounds) return;
+      this.updateCameraBoundsFromBox(bounds, { syncCut: false });
+      const center = bounds.getCenter(new THREE.Vector3());
+      const size = bounds.getSize(new THREE.Vector3());
+      const radius = Math.max(size.length(), 1) * 1.25;
+      const dir = new THREE.Vector3(1, -1, 0.75).normalize();
+      const pos = center.clone().addScaledVector(dir, radius);
+      await this.settleOrWarn(
+        this.cameraComponent.controls.setLookAt(pos.x, pos.y, pos.z, center.x, center.y, center.z, true),
+        1200,
+        "camera.setLookAt(3d)",
+        { warnOnTimeout: false, warnOnReject: false }
+      );
+      await this.fitMeshesWithFallback(meshes, 1.1, bounds);
+      this.noteHistory("tool", "View mode", "3D perspective");
+      return;
     }
 
+    await this.setViewPreset("top", { orthographic: true });
+    this.noteHistory("tool", "View mode", "2D orthographic");
+  }
+
+  async setViewPreset(
+    preset: ViewerViewPreset,
+    opts?: { orthographic?: boolean }
+  ) {
+    const meshes = this.getCurrentModelMeshes();
     if (meshes.length === 0) return;
-    await this.cameraComponent.fit(meshes, 1.15);
-    this.centerCameraTargetToMeshes(meshes);
+
+    const bounds = this.getCurrentModelBounds();
+    if (!bounds) return;
+
+    const center = bounds.getCenter(new THREE.Vector3());
+    const size = bounds.getSize(new THREE.Vector3());
+    const radius = Math.max(size.length(), 1) * 1.35;
+
+    const directionMap: Record<ViewerViewPreset, THREE.Vector3> = {
+      top: new THREE.Vector3(0, 0, 1),
+      bottom: new THREE.Vector3(0, 0, -1),
+      front: new THREE.Vector3(0, -1, 0),
+      left: new THREE.Vector3(-1, 0, 0),
+      right: new THREE.Vector3(1, 0, 0),
+      back: new THREE.Vector3(0, 1, 0),
+    };
+
+    const dir = directionMap[preset].clone().normalize();
+    const pos = center.clone().addScaledVector(dir, radius);
+    const up =
+      preset === "top"
+        ? new THREE.Vector3(0, 1, 0)
+        : preset === "bottom"
+          ? new THREE.Vector3(0, -1, 0)
+          : new THREE.Vector3(0, 0, 1);
+
+    if (opts?.orthographic) {
+      await this.cameraComponent.projection.set("Orthographic");
+    }
+
+    this.updateCameraBoundsFromBox(bounds, { syncCut: false });
+    this.cameraComponent.three.up.copy(up);
+    await this.settleOrWarn(
+      this.cameraComponent.controls.setLookAt(pos.x, pos.y, pos.z, center.x, center.y, center.z, true),
+      1200,
+      `camera.setLookAt(${preset})`,
+      { warnOnTimeout: false, warnOnReject: false }
+    );
+    await this.fitMeshesWithFallback(meshes, 1.04, bounds);
+    this.noteHistory("tool", "View preset", preset);
   }
 
   async loadIfcFromUrl(url: string, name: string) {
@@ -1450,6 +1868,7 @@ export class ViewerApp {
     // Register materials for clipping (after BVH so we don't fight buffer transfers).
     this.section.registerMaterialsFrom(model.object);
 
+    await this.cameraComponent.projection.set("Perspective");
     await this.frameModel();
 
     // Populate class + storey groups for UI (tree/filters).
@@ -1458,6 +1877,7 @@ export class ViewerApp {
     // Keep visibility/cut/filter states coherent after loading.
     await this.applyVisibilityFromState();
     await this.applyCutFromState();
+    await this.setActiveTool("select");
 
     // Compare against previous IFC revision snapshot and store current one.
     const currentSnapshot = await this.captureRevisionSnapshot(model, name);
@@ -1488,6 +1908,7 @@ export class ViewerApp {
 
     // Register materials for clipping and frame quickly so the user can interact immediately.
     this.section.registerMaterialsFrom(root);
+    await this.cameraComponent.projection.set("Perspective");
     await this.frameModel();
     this.cameraComponent.enabled = true;
 
@@ -1500,6 +1921,7 @@ export class ViewerApp {
       warnOnTimeout: false,
       warnOnReject: false,
     });
+    await this.setActiveTool("select");
   }
 
   private async buildGroupsForModel(model: FRAGS.FragmentsModel) {
@@ -1584,6 +2006,15 @@ export class ViewerApp {
   }
 
   async hideSelected() {
+    if (this.glbSelectedObject) {
+      this.glbSelectedObject.visible = false;
+      this.setGlbSelectedObject(null, { updateProperties: true, noteHistory: false });
+      this.setGlbHoveredObject(null);
+      toast("Hidden object", { description: "GLB object hidden." });
+      this.noteHistory("visibility", "Hidden GLB object");
+      return;
+    }
+
     const raw = useViewerStore.getState().selection;
     const map = rawToModelIdMap(raw);
     if (isEmptyMap(map)) return;
@@ -1596,6 +2027,30 @@ export class ViewerApp {
   }
 
   async isolateSelected() {
+    if (this.glbSelectedObject && this.glbRoot && !this.hasIfcModels()) {
+      if (!this.glbIsolateSnapshot) {
+        const snapshot = new Map<THREE.Object3D, boolean>();
+        this.glbRoot.traverse((obj: THREE.Object3D) => {
+          const mesh = obj as THREE.Mesh;
+          if (mesh.isMesh) snapshot.set(mesh, mesh.visible);
+        });
+        this.glbIsolateSnapshot = snapshot;
+
+        const keep = new Set<THREE.Object3D>();
+        this.glbSelectedObject.traverse((obj: THREE.Object3D) => keep.add(obj));
+        this.glbRoot.traverse((obj: THREE.Object3D) => {
+          const mesh = obj as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          mesh.visible = keep.has(mesh);
+        });
+        toast("Isolation", { description: "Isolated GLB selection." });
+        this.noteHistory("visibility", "GLB isolation enabled");
+      } else {
+        await this.restoreIsolation();
+      }
+      return;
+    }
+
     const raw = useViewerStore.getState().selection;
     const map = rawToModelIdMap(raw);
     if (isEmptyMap(map)) return;
@@ -1614,6 +2069,16 @@ export class ViewerApp {
   }
 
   private async restoreIsolation() {
+    if (this.glbIsolateSnapshot) {
+      for (const [obj, visible] of this.glbIsolateSnapshot) {
+        obj.visible = visible;
+      }
+      this.glbIsolateSnapshot = null;
+      toast("Isolation", { description: "Restored GLB visibility." });
+      this.noteHistory("visibility", "GLB isolation cleared");
+      return;
+    }
+
     this.isolateActive = false;
     this.hiddenBeforeIsolateRaw = null;
     await this.applyVisibilityFromState();
@@ -1622,6 +2087,14 @@ export class ViewerApp {
   }
 
   async unhideAll() {
+    if (this.glbRoot) {
+      this.glbRoot.traverse((obj: THREE.Object3D) => {
+        const mesh = obj as THREE.Mesh;
+        if (mesh.isMesh) mesh.visible = true;
+      });
+      this.glbIsolateSnapshot = null;
+    }
+
     if (this.hasIfcModels()) {
       await this.hider.set(true);
     }
@@ -1692,6 +2165,7 @@ export class ViewerApp {
   }
 
   async selectGroup(group: { type: "class" | "storey"; id: string }) {
+    this.setGlbSelectedObject(null, { updateProperties: false, noteHistory: false });
     const map =
       group.type === "class"
         ? this.classGroupItems.get(group.id)
@@ -1782,6 +2256,9 @@ export class ViewerApp {
     this.section.setEnabled(enabled);
     this.section.setMode("box");
     if (enabled) this.refreshSectionMaterialsIfNeeded();
+    if (!enabled && this.glbRoot && !this.hasIfcModels() && useViewerStore.getState().cut.enabled) {
+      this.queueApplyCut();
+    }
     this.noteHistory("tool", enabled ? "Section enabled" : "Section disabled");
   }
 
@@ -2044,8 +2521,41 @@ export class ViewerApp {
     this.noteHistory("filter", "Property filter imported");
   }
 
+  private applyGlbCutFromState() {
+    const state = useViewerStore.getState();
+    const cut = state.cut;
+    const section = state.section;
+
+    if (!this.glbRoot) return;
+
+    // Section box has priority over single-plane cut when both are toggled.
+    if (section.enabled) {
+      this.section.setMode("box");
+      this.section.setInvert(section.invert);
+      this.section.setEnabled(true);
+      return;
+    }
+
+    if (!cut.enabled) {
+      this.section.setEnabled(false);
+      return;
+    }
+
+    this.section.setMode("plane");
+    this.section.setPlaneAxis(cut.orientation === "horizontal" ? "z" : "x");
+    this.section.setPlaneOffset(cut.offset);
+    this.section.setInvert(cut.flip);
+    this.section.setEnabled(true);
+  }
+
   private async applyCutFromState() {
     const cut = useViewerStore.getState().cut;
+    if (!this.hasIfcModels() && this.glbRoot) {
+      this.cutHidden = emptyModelIdMap();
+      this.applyGlbCutFromState();
+      return;
+    }
+
     if (!cut.enabled) {
       this.cutHidden = emptyModelIdMap();
       await this.applyVisibilityFromState();
@@ -2165,7 +2675,9 @@ export class ViewerApp {
 
   async reset() {
     await this.setActiveTool("select");
-    await this.hider.set(true);
+    if (this.hasIfcModels()) {
+      await this.hider.set(true);
+    }
     this.manualHidden = emptyModelIdMap();
     this.appliedHidden = emptyModelIdMap();
     this.visibilityForceFullApply = false;
@@ -2193,6 +2705,7 @@ export class ViewerApp {
     this.resetSectionBox();
 
     this.clearMeasurements();
+    await this.cameraComponent.projection.set("Perspective");
     await this.clearSelection();
     await this.clearHover();
     await this.frameModel();

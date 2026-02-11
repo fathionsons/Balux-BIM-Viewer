@@ -17,6 +17,8 @@ export class MeasureTool implements ViewerTool {
   private start: THREE.Vector3 | null = null;
   private shortestFrom: ViewerSelectionKey | null = null;
   private previewLine: THREE.Line | null = null;
+  private previewArrowStart: THREE.ArrowHelper | null = null;
+  private previewArrowEnd: THREE.ArrowHelper | null = null;
   private previewLabel: CSS2DObject | null = null;
   private moveRaf = 0;
   private lastMoveEv: PointerEvent | null = null;
@@ -126,6 +128,7 @@ export class MeasureTool implements ViewerTool {
     const end = hit.point;
     (this.previewLine!.geometry as THREE.BufferGeometry).setFromPoints([start, end]);
     this.previewLine!.computeLineDistances();
+    this.updatePreviewArrows(start, end);
 
     const meters = start.distanceTo(end);
     const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
@@ -141,9 +144,9 @@ export class MeasureTool implements ViewerTool {
       new THREE.Vector3(),
     ]);
     const mat = new THREE.LineDashedMaterial({
-      color: new THREE.Color("#0ea5e9"),
+      color: new THREE.Color("#ef4444"),
       transparent: true,
-      opacity: 0.9,
+      opacity: 0.95,
       dashSize: 0.1,
       gapSize: 0.06,
     });
@@ -152,21 +155,69 @@ export class MeasureTool implements ViewerTool {
     line.frustumCulled = false;
     line.name = "MeasurePreviewLine";
 
+    const arrowColor = new THREE.Color("#ef4444");
+    const arrowStart = new THREE.ArrowHelper(
+      new THREE.Vector3(1, 0, 0),
+      new THREE.Vector3(),
+      0.08,
+      arrowColor,
+      0.08,
+      0.04
+    );
+    const arrowEnd = new THREE.ArrowHelper(
+      new THREE.Vector3(-1, 0, 0),
+      new THREE.Vector3(),
+      0.08,
+      arrowColor,
+      0.08,
+      0.04
+    );
+    arrowStart.line.frustumCulled = false;
+    arrowEnd.line.frustumCulled = false;
+    arrowStart.name = "MeasurePreviewArrowStart";
+    arrowEnd.name = "MeasurePreviewArrowEnd";
+
     const el = document.createElement("div");
     el.className =
-      "pointer-events-none select-none rounded-md border border-slate-200 bg-white/95 px-2 py-1 text-[11px] font-medium text-slate-900 shadow-panel backdrop-blur";
+      "pointer-events-none select-none rounded-md border border-rose-300 bg-white/95 px-2 py-1 text-[11px] font-semibold text-rose-700 shadow-panel backdrop-blur";
     const label = new CSS2DObject(el);
     label.name = "MeasurePreviewLabel";
 
     app.scene.add(line);
+    app.scene.add(arrowStart);
+    app.scene.add(arrowEnd);
     app.scene.add(label);
     this.previewLine = line;
+    this.previewArrowStart = arrowStart;
+    this.previewArrowEnd = arrowEnd;
     this.previewLabel = label;
   }
 
   private setPreviewVisible(visible: boolean) {
     if (this.previewLine) this.previewLine.visible = visible;
+    if (this.previewArrowStart) this.previewArrowStart.visible = visible;
+    if (this.previewArrowEnd) this.previewArrowEnd.visible = visible;
     if (this.previewLabel) this.previewLabel.visible = visible;
+  }
+
+  private updatePreviewArrows(start: THREE.Vector3, end: THREE.Vector3) {
+    if (!this.previewArrowStart || !this.previewArrowEnd) return;
+    const dir = new THREE.Vector3().subVectors(end, start);
+    const len = dir.length();
+    const visible = len > 1e-4;
+    this.previewArrowStart.visible = visible;
+    this.previewArrowEnd.visible = visible;
+    if (!visible) return;
+
+    dir.multiplyScalar(1 / len);
+    const head = THREE.MathUtils.clamp(len * 0.14, 0.05, 0.3);
+    this.previewArrowStart.position.copy(start);
+    this.previewArrowStart.setDirection(dir);
+    this.previewArrowStart.setLength(head, head * 0.9, head * 0.55);
+
+    this.previewArrowEnd.position.copy(end);
+    this.previewArrowEnd.setDirection(dir.clone().negate());
+    this.previewArrowEnd.setLength(head, head * 0.9, head * 0.55);
   }
 
   private disposePreviewObjects(app: ViewerApp) {
@@ -175,6 +226,22 @@ export class MeasureTool implements ViewerTool {
       (this.previewLine.geometry as THREE.BufferGeometry).dispose();
       (this.previewLine.material as THREE.Material).dispose();
       this.previewLine = null;
+    }
+    if (this.previewArrowStart) {
+      this.previewArrowStart.removeFromParent();
+      this.previewArrowStart.line.geometry.dispose();
+      (this.previewArrowStart.line.material as THREE.Material).dispose();
+      this.previewArrowStart.cone.geometry.dispose();
+      (this.previewArrowStart.cone.material as THREE.Material).dispose();
+      this.previewArrowStart = null;
+    }
+    if (this.previewArrowEnd) {
+      this.previewArrowEnd.removeFromParent();
+      this.previewArrowEnd.line.geometry.dispose();
+      (this.previewArrowEnd.line.material as THREE.Material).dispose();
+      this.previewArrowEnd.cone.geometry.dispose();
+      (this.previewArrowEnd.cone.material as THREE.Material).dispose();
+      this.previewArrowEnd = null;
     }
     if (this.previewLabel) {
       this.previewLabel.removeFromParent();

@@ -21,6 +21,12 @@ export function TopBar() {
 
   const toErrorMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+  const getViewerMethod = <K extends string>(name: K) => {
+    if (!viewer) return null;
+    const fn = (viewer as unknown as Record<string, unknown>)[name];
+    return typeof fn === "function" ? (fn as (...args: unknown[]) => unknown) : null;
+  };
+
   const runSafe = async (title: string, fn: () => Promise<void>) => {
     try {
       await fn();
@@ -88,6 +94,47 @@ export function TopBar() {
     await viewer.reset();
   };
 
+  const setViewMode = async (mode: "3d" | "2d") => {
+    if (!viewer) return;
+    const setMode = getViewerMethod("setViewMode");
+    if (setMode) {
+      await Promise.resolve(setMode.call(viewer, mode));
+      return;
+    }
+
+    const setPreset = getViewerMethod("setViewPreset");
+    if (mode === "2d" && setPreset) {
+      await Promise.resolve(setPreset.call(viewer, "top"));
+      return;
+    }
+
+    const frame = getViewerMethod("frameModel");
+    if (mode === "3d" && frame) {
+      await Promise.resolve(frame.call(viewer));
+      return;
+    }
+
+    throw new Error("Viewer runtime is reloading. Please wait a moment and try again.");
+  };
+
+  const setViewPreset = async (preset: "top" | "bottom" | "front" | "left" | "right" | "back") => {
+    if (!viewer) return;
+    const setPreset = getViewerMethod("setViewPreset");
+    if (!setPreset) {
+      throw new Error("Viewer runtime is reloading. Please wait a moment and try again.");
+    }
+    await Promise.resolve(setPreset.call(viewer, preset));
+  };
+
+  const frameModel = async () => {
+    if (!viewer) return;
+    const frame = getViewerMethod("frameModel");
+    if (!frame) {
+      throw new Error("Viewer runtime is reloading. Please wait a moment and try again.");
+    }
+    await Promise.resolve(frame.call(viewer));
+  };
+
   return (
     <div className="flex h-[52px] items-center justify-between border-b border-slate-200 bg-white/75 px-3 backdrop-blur">
       <div className="flex items-center gap-3">
@@ -112,6 +159,60 @@ export function TopBar() {
 
       <TooltipProvider delayDuration={250}>
         <div className="flex items-center gap-2">
+          <div className="mr-1 hidden items-center gap-1 rounded-md border border-slate-200 bg-white/80 px-1 py-1 md:flex">
+            <Button variant="ghost" size="sm" onClick={() => void runSafe("View change failed", () => setViewMode("3d"))}>
+              3D
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => void runSafe("View change failed", () => setViewMode("2d"))}>
+              2D
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void runSafe("View change failed", () => setViewPreset("top"))}
+            >
+              Top
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void runSafe("View change failed", () => setViewPreset("front"))}
+            >
+              Front
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void runSafe("View change failed", () => setViewPreset("left"))}
+            >
+              Left
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void runSafe("View change failed", () => setViewPreset("right"))}
+            >
+              Right
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void runSafe("View change failed", () => setViewPreset("back"))}
+            >
+              Back
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void runSafe("View change failed", () => setViewPreset("bottom"))}
+            >
+              Bottom
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => void runSafe("Frame failed", frameModel)}>
+              Fit
+            </Button>
+          </div>
+
           <input
             ref={fileRef}
             type="file"

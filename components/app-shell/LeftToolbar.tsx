@@ -55,7 +55,7 @@ export function LeftToolbar() {
           <ToolButton
             active={activeTool === "cut"}
             icon={<Slice className="h-4 w-4" />}
-            label={isTouchDevice ? `${advancedMsg}` : "Cut plane (C) • drag in model"}
+            label={isTouchDevice ? `${advancedMsg}` : "Cut plane (C) - drag in model"}
             onClick={() => setTool("cut")}
             disabled={isTouchDevice}
           />
