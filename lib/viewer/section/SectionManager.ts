@@ -253,6 +253,10 @@ export class SectionManager {
     return this.gizmoVisible;
   }
 
+  setControlSize(size: number) {
+    this.controls.size = THREE.MathUtils.clamp(size, 0.75, 2.8);
+  }
+
   setTransformMode(mode: "translate" | "rotate" | "scale") {
     if (this.lockRotation && mode === "rotate") {
       this.controls.setMode("translate");

@@ -319,6 +319,7 @@ function FiltersTab() {
             <div className="mt-0.5 text-[11px] text-slate-500">
               Shortcuts: `X` `Y` `Z` axis, `V` cycle axis, `[` and `]` nudge.
             </div>
+            <div className="mt-0.5 text-[11px] text-slate-500">Hold `Shift` for fine scrub, `Alt` for fast scrub.</div>
           </div>
 
           <div className="mt-3 text-xs font-medium text-slate-700">Ignore cut for classes</div>
@@ -472,6 +473,7 @@ function FiltersTab() {
               disabled={isTouchDevice}
             />
           </div>
+          <div className="mt-2 text-[11px] text-slate-500">Shortcuts: `W`/`T` move, `E`/`R` rotate, `0` reset.</div>
           {isTouchDevice ? <div className="mt-2 text-[11px] text-slate-500">Advanced tools available on desktop</div> : null}
         </div>
 
@@ -653,4 +655,3 @@ function Row({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
-

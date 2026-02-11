@@ -48,7 +48,9 @@ export class CutTool implements ViewerTool {
     const viewportSpan = dir === "vertical" ? app.container.clientHeight : app.container.clientWidth;
     const safeViewport = Math.max(1, viewportSpan);
     const normalized = dir === "vertical" ? -deltaPx / safeViewport : deltaPx / safeViewport;
-    app.setCutOffset(this.dragStartOffset + normalized * range);
+    const baseSensitivity = 0.78;
+    const precision = ev.shiftKey ? 0.28 : ev.altKey ? 1.75 : 1;
+    app.setCutOffset(this.dragStartOffset + normalized * range * baseSensitivity * precision);
   }
 
   onPointerUp(app: ViewerApp, ev: PointerEvent) {

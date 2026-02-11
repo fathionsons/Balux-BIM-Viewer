@@ -396,21 +396,23 @@ export class ViewerApp {
 
     // camera-controls tuning for Dalux-like BIM navigation.
     const controls = this.cameraComponent.controls;
-    controls.smoothTime = 0.1;
-    controls.draggingSmoothTime = 0.12;
-    controls.dollySpeed = 0.9;
-    controls.truckSpeed = 1.5;
-    controls.azimuthRotateSpeed = 0.7;
-    controls.polarRotateSpeed = 0.7;
+    controls.smoothTime = 0.085;
+    controls.draggingSmoothTime = 0.095;
+    controls.dollySpeed = 1.0;
+    controls.truckSpeed = 1.9;
+    controls.azimuthRotateSpeed = 0.92;
+    controls.polarRotateSpeed = 0.9;
     controls.dollyToCursor = true;
     controls.infinityDolly = false;
-    controls.boundaryFriction = 0.15;
+    controls.boundaryFriction = 0.08;
     controls.minPolarAngle = 0.01;
-    controls.maxPolarAngle = Math.PI / 2 - 0.02;
+    controls.maxPolarAngle = Math.PI - 0.01;
     controls.minDistance = 0.5;
     controls.maxDistance = 5000;
-    controls.minZoom = 0.05;
-    controls.maxZoom = 200;
+    controls.minZoom = 0.04;
+    controls.maxZoom = 260;
+    controls.restThreshold = 0.0015;
+    controls.boundaryEnclosesCamera = true;
     controls.mouseButtons.left = CameraControls.ACTION.NONE;
     controls.mouseButtons.right = CameraControls.ACTION.ROTATE;
     controls.mouseButtons.middle = CameraControls.ACTION.TRUCK;
@@ -1039,9 +1041,18 @@ export class ViewerApp {
     this.cameraBoundsDiag = diag;
 
     const controls = this.cameraComponent.controls;
-    controls.minDistance = Math.max(0.2, diag * 0.01);
-    controls.maxDistance = Math.max(200, diag * 20);
+    controls.minDistance = Math.max(0.12, diag * 0.0025);
+    controls.maxDistance = Math.max(220, diag * 24);
+    controls.minZoom = Math.max(0.02, Math.min(0.22, 40 / Math.max(diag, 1)));
+    controls.maxZoom = Math.max(120, Math.min(900, diag * 1.3));
+    controls.truckSpeed = THREE.MathUtils.clamp(diag * 0.018, 0.8, 6.2);
+    controls.dollySpeed = THREE.MathUtils.clamp(0.75 + Math.log10(diag + 1) * 0.26, 0.72, 1.7);
+    controls.azimuthRotateSpeed = THREE.MathUtils.clamp(0.75 + Math.log10(diag + 1) * 0.08, 0.75, 1.25);
+    controls.polarRotateSpeed = controls.azimuthRotateSpeed;
     controls.setBoundary(box.clone().expandByScalar(diag * 4));
+    const gizmoSize = THREE.MathUtils.clamp(0.95 + Math.log10(diag + 1) * 0.38, 0.95, 2.5);
+    this.section.setControlSize(gizmoSize);
+    this.modelTransform.setControlSize(gizmoSize);
 
     const cam = this.cameraComponent.three;
     if (cam instanceof THREE.PerspectiveCamera) {
@@ -2516,6 +2527,7 @@ export class ViewerApp {
   setCutOffset(offset: number) {
     const cut = useViewerStore.getState().cut;
     const clamped = Math.min(Math.max(offset, cut.min), cut.max);
+    if (Math.abs(clamped - cut.offset) < 1e-7) return;
     useViewerStore.getState().setCut({ offset: clamped });
     this.queueApplyCut();
   }

@@ -104,6 +104,10 @@ export class ModelTransformManager {
     this.updateVisibility();
   }
 
+  setControlSize(size: number) {
+    this.controls.size = THREE.MathUtils.clamp(size, 0.75, 2.6);
+  }
+
   getGizmoVisible() {
     return this.gizmoVisible;
   }

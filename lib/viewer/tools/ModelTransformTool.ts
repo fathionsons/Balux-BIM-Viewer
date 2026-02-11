@@ -25,12 +25,12 @@ export class ModelTransformTool implements ViewerTool {
 
   onKeyDown(app: ViewerApp, ev: KeyboardEvent) {
     const key = ev.key.toLowerCase();
-    if (key === "r") {
+    if (key === "r" || key === "e") {
       app.setModelTransformMode("rotate");
       ev.preventDefault();
       return;
     }
-    if (key === "t") {
+    if (key === "t" || key === "w") {
       app.setModelTransformMode("translate");
       ev.preventDefault();
       return;
