@@ -10,11 +10,13 @@ import { toast } from "sonner";
 import { BvhManager } from "./bvh/BvhManager";
 import { MeasurementManager } from "./measure/MeasurementManager";
 import { SectionManager } from "./section/SectionManager";
+import { ModelTransformManager } from "./transform/ModelTransformManager";
 import { ToolManager } from "./tools/ToolManager";
 import { SelectTool } from "./tools/SelectTool";
 import { MeasureTool } from "./tools/MeasureTool";
 import { CutTool } from "./tools/CutTool";
 import { SectionBoxTool } from "./tools/SectionBoxTool";
+import { ModelTransformTool } from "./tools/ModelTransformTool";
 import {
   type ViewerMeasurementMode,
   type ViewerPropertyFilterState,
@@ -249,6 +251,7 @@ export type ViewerRaycastHit = {
 };
 
 type ViewerViewPreset = "top" | "bottom" | "front" | "left" | "right" | "back";
+type ViewerUpAxis = "y" | "z";
 
 export class ViewerApp {
   static async create(container: HTMLElement) {
@@ -275,6 +278,7 @@ export class ViewerApp {
   readonly tools: ToolManager;
   readonly bvh: BvhManager;
   readonly section: SectionManager;
+  readonly modelTransform: ModelTransformManager;
   readonly measurements: MeasurementManager;
 
   // Optional non-BIM visual model (GLB). This is intentionally separate from fragments/IFC.
@@ -294,7 +298,7 @@ export class ViewerApp {
   private itemBoxesByModel = new Map<string, Map<number, THREE.Box3>>();
   private itemCutSamplesByModel = new Map<
     string,
-    Array<{ localId: number; sampleX: number; sampleZ: number; classId?: string }>
+    Array<{ localId: number; sampleX: number; sampleY: number; sampleZ: number; classId?: string }>
   >();
 
   private cutHidden: ModelIdMap = emptyModelIdMap();
@@ -325,7 +329,8 @@ export class ViewerApp {
   private statsUnsub?: () => void;
 
   // Keep navigation above model "ground" and scale camera limits per model size.
-  private cameraGroundZ: number | null = null;
+  private modelUpAxis: ViewerUpAxis = "z";
+  private cameraGroundCoord: number | null = null;
   private cameraBoundsCenter: THREE.Vector3 | null = null;
   private cameraBoundsDiag = 1;
   private tmpCamPos = new THREE.Vector3();
@@ -341,10 +346,12 @@ export class ViewerApp {
   private hasSelectHighlight = false;
   private hoverClearInFlight: Promise<void> | null = null;
   private selectClearInFlight: Promise<void> | null = null;
-  private cutBounds: { xMin: number; xMax: number; zMin: number; zMax: number } | null = null;
+  private cutBounds: { xMin: number; xMax: number; yMin: number; yMax: number; zMin: number; zMax: number } | null =
+    null;
   private cutApplyRaf = 0;
   private cutApplyQueued = false;
   private cutApplyInFlight = false;
+  private modelTransformRefreshRaf = 0;
 
   private constructor(container: HTMLElement) {
     this.container = container;
@@ -374,6 +381,7 @@ export class ViewerApp {
     this.rendererComponent.three.setClearColor(new THREE.Color("#f8fafc"), 1);
     this.rendererComponent.three.localClippingEnabled = true;
     this.rendererComponent.three.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.rendererComponent.three.domElement.style.touchAction = "none";
 
     this.cameraComponent = new OBC.OrthoPerspectiveCamera(this.components);
 
@@ -447,6 +455,17 @@ export class ViewerApp {
         this.cameraComponent.enabled = !dragging;
       },
     });
+    this.modelTransform = new ModelTransformManager({
+      scene: this.scene,
+      camera: this.cameraComponent.three,
+      dom: this.rendererComponent.three.domElement,
+      onDraggingChanged: (dragging) => {
+        this.cameraComponent.enabled = !dragging;
+      },
+      onTransformChanged: () => {
+        this.queueModelTransformRefresh();
+      },
+    });
     this.glbHoverHelper.name = "GLBHoverHelper";
     this.glbHoverHelper.visible = false;
     this.glbSelectHelper.name = "GLBSelectHelper";
@@ -459,6 +478,7 @@ export class ViewerApp {
     this.tools.register(new MeasureTool());
     this.tools.register(new CutTool());
     this.tools.register(new SectionBoxTool());
+    this.tools.register(new ModelTransformTool());
   }
 
   private async init() {
@@ -557,6 +577,11 @@ export class ViewerApp {
     // Section workflow defaults.
     this.section.setMode("box");
     this.section.setLockRotation(useViewerStore.getState().section.lockRotation);
+    this.section.setGizmoVisible(useViewerStore.getState().section.showGizmo);
+
+    // Model transform defaults.
+    this.modelTransform.setMode(useViewerStore.getState().transform.mode);
+    this.modelTransform.setGizmoVisible(useViewerStore.getState().transform.gizmoVisible);
 
     // Default tool.
     await this.setActiveTool("select");
@@ -593,9 +618,11 @@ export class ViewerApp {
 
     this.statsUnsub?.();
     if (this.cutApplyRaf) cancelAnimationFrame(this.cutApplyRaf);
+    if (this.modelTransformRefreshRaf) cancelAnimationFrame(this.modelTransformRefreshRaf);
     this.cutApplyRaf = 0;
     this.cutApplyQueued = false;
     this.cutApplyInFlight = false;
+    this.modelTransformRefreshRaf = 0;
     this.disposeGlbRoot();
     this.glbHoverHelper.removeFromParent();
     this.glbSelectHelper.removeFromParent();
@@ -615,6 +642,7 @@ export class ViewerApp {
     } else {
       selectMaterial.dispose();
     }
+    this.modelTransform.dispose();
     this.section.dispose();
     this.measurements.dispose();
     this.bvh.dispose();
@@ -699,6 +727,11 @@ export class ViewerApp {
     }
     if (key === "b") {
       void this.setActiveTool("section");
+      ev.preventDefault();
+      return;
+    }
+    if (key === "g") {
+      void this.setActiveTool("transform");
       ev.preventDefault();
       return;
     }
@@ -922,6 +955,7 @@ export class ViewerApp {
     this.glbSelectHelper.visible = false;
     this.glbHoverHelper.box.makeEmpty();
     this.glbSelectHelper.box.makeEmpty();
+    this.syncModelTransformTarget();
 
     for (const g of geometries) g.dispose();
     for (const t of textures) t.dispose();
@@ -982,10 +1016,7 @@ export class ViewerApp {
       }
 
       const opts = options as AddEventListenerOptions;
-      if (opts.passive === undefined) {
-        return original(type, listener, { ...opts, passive: true });
-      }
-      return original(type, listener, opts);
+      return original(type, listener, { ...opts, passive: true });
     }) as typeof target.addEventListener;
 
     target.addEventListener = patched;
@@ -1000,8 +1031,10 @@ export class ViewerApp {
     box.getSize(size);
     box.getCenter(center);
     const diag = Math.max(size.length(), 1);
+    const upAxis = this.modelUpAxis;
 
-    this.cameraGroundZ = box.min.z + Math.max(0.02, size.z * 0.01);
+    this.cameraGroundCoord =
+      this.getAxisComponent(box.min, upAxis) + Math.max(0.02, this.getAxisComponent(size, upAxis) * 0.01);
     this.cameraBoundsCenter = center;
     this.cameraBoundsDiag = diag;
 
@@ -1025,33 +1058,35 @@ export class ViewerApp {
       this.cutBounds = {
         xMin: box.min.x,
         xMax: box.max.x,
+        yMin: box.min.y,
+        yMax: box.max.y,
         zMin: box.min.z,
         zMax: box.max.z,
       };
-      this.syncCutRangeForOrientation(useViewerStore.getState().cut.orientation, { center: true });
+      this.syncCutRangeForAxis(useViewerStore.getState().cut.axis, { center: true });
     }
   }
 
   private clampCameraAboveGround() {
-    if (this.cameraGroundZ == null) return;
+    if (this.cameraGroundCoord == null) return;
 
     const controls = this.cameraComponent.controls;
     const pos = controls.getPosition(this.tmpCamPos);
     const target = controls.getTarget(this.tmpCamTarget);
+    const upAxis = this.modelUpAxis;
 
-    let changed = false;
-    if (pos.z < this.cameraGroundZ) {
-      pos.z = this.cameraGroundZ;
-      changed = true;
-    }
-    if (target.z < this.cameraGroundZ) {
-      target.z = this.cameraGroundZ;
-      changed = true;
-    }
+    const posCoord = this.getAxisComponent(pos, upAxis);
+    const targetCoord = this.getAxisComponent(target, upAxis);
+    const floor = this.cameraGroundCoord;
+    const epsilon = Math.max(this.cameraBoundsDiag * 0.0025, 0.01);
+    if (posCoord >= floor - epsilon || targetCoord >= floor - epsilon) return;
 
-    if (changed) {
-      void controls.setLookAt(pos.x, pos.y, pos.z, target.x, target.y, target.z, false);
-    }
+    const lift = floor - Math.min(posCoord, targetCoord);
+    const axisLift = Math.max(lift, epsilon);
+    this.setAxisComponent(pos, upAxis, posCoord + axisLift);
+    this.setAxisComponent(target, upAxis, targetCoord + axisLift);
+
+    void controls.setLookAt(pos.x, pos.y, pos.z, target.x, target.y, target.z, false);
   }
 
   private isFiniteVector(v: THREE.Vector3) {
@@ -1068,7 +1103,7 @@ export class ViewerApp {
 
     if (!this.isFiniteVector(pos) || !this.isFiniteVector(target)) {
       const dist = Math.max(this.cameraBoundsDiag * 1.4, 3);
-      const dir = this.tmpCamDelta.set(1, -1, 0.75).normalize();
+      const dir = this.tmpCamDelta.copy(this.getDefault3dDirection());
       const nextPos = center.clone().addScaledVector(dir, dist);
       void controls.setLookAt(nextPos.x, nextPos.y, nextPos.z, center.x, center.y, center.z, false);
       return;
@@ -1085,7 +1120,7 @@ export class ViewerApp {
     const maxDistance = Math.max(this.cameraBoundsDiag * 12, controls.maxDistance * 1.2);
     if (cameraDistance > maxDistance) {
       const dir = this.tmpCamDelta.copy(pos).sub(target);
-      if (dir.lengthSq() < 1e-8) dir.set(1, -1, 0.75);
+      if (dir.lengthSq() < 1e-8) dir.copy(this.getDefault3dDirection());
       dir.normalize().multiplyScalar(Math.max(this.cameraBoundsDiag * 2.5, controls.maxDistance * 0.85));
       pos.copy(target).add(dir);
       changed = true;
@@ -1148,6 +1183,82 @@ export class ViewerApp {
 
   private hasIfcModels() {
     return this.fragments.list.size > 0;
+  }
+
+  private axisVector(axis: "x" | "y" | "z", sign = 1) {
+    if (axis === "x") return new THREE.Vector3(sign, 0, 0);
+    if (axis === "y") return new THREE.Vector3(0, sign, 0);
+    return new THREE.Vector3(0, 0, sign);
+  }
+
+  private getAxisComponent(v: THREE.Vector3, axis: "x" | "y" | "z") {
+    return axis === "x" ? v.x : axis === "y" ? v.y : v.z;
+  }
+
+  private setAxisComponent(v: THREE.Vector3, axis: "x" | "y" | "z", value: number) {
+    if (axis === "x") v.x = value;
+    else if (axis === "y") v.y = value;
+    else v.z = value;
+  }
+
+  private getModelUpVector(sign = 1) {
+    return this.axisVector(this.modelUpAxis, sign);
+  }
+
+  private getTopViewUpVector(sign = 1) {
+    // Screen-up for top/bottom views should be one of the horizontal axes.
+    return this.modelUpAxis === "z" ? this.axisVector("y", sign) : this.axisVector("z", sign);
+  }
+
+  private getDefault3dDirection() {
+    return this.modelUpAxis === "z"
+      ? new THREE.Vector3(1, -1, 0.75).normalize()
+      : new THREE.Vector3(1, 0.8, -1).normalize();
+  }
+
+  private detectUpAxisFromObject(root: THREE.Object3D): ViewerUpAxis {
+    const up = root.up ?? new THREE.Vector3(0, 1, 0);
+    return Math.abs(up.y) >= Math.abs(up.z) ? "y" : "z";
+  }
+
+  private getTransformTargetRoot() {
+    if (this.glbRoot) return this.glbRoot;
+    const firstModel = this.fragments.list.values().next().value as FRAGS.FragmentsModel | undefined;
+    return firstModel?.object ?? null;
+  }
+
+  private syncModelTransformTarget() {
+    this.modelTransform.setTarget(this.getTransformTargetRoot());
+  }
+
+  private queueModelTransformRefresh() {
+    if (this.modelTransformRefreshRaf || this.disposed) return;
+    this.modelTransformRefreshRaf = requestAnimationFrame(() => {
+      this.modelTransformRefreshRaf = 0;
+      this.applyModelTransformRefresh();
+    });
+  }
+
+  private applyModelTransformRefresh() {
+    const bounds = this.getCurrentModelBounds();
+    if (!bounds) return;
+
+    this.updateCameraBoundsFromBox(bounds, { syncCut: false });
+    this.cutBounds = {
+      xMin: bounds.min.x,
+      xMax: bounds.max.x,
+      yMin: bounds.min.y,
+      yMax: bounds.max.y,
+      zMin: bounds.min.z,
+      zMax: bounds.max.z,
+    };
+    this.syncCutRangeForAxis(useViewerStore.getState().cut.axis, { preserveRatio: true });
+
+    // IFC cut-by-hidden-IDs depends on cached sample positions.
+    const cut = useViewerStore.getState().cut;
+    if (cut.enabled && this.hasIfcModels()) {
+      this.queueApplyCut();
+    }
   }
 
   private updateGlbHelper(helper: THREE.Box3Helper, object: THREE.Object3D | null) {
@@ -1249,23 +1360,24 @@ export class ViewerApp {
     this.centerCameraTargetToMeshes(meshes);
   }
 
-  getCutCursor(orientation = useViewerStore.getState().cut.orientation) {
-    return orientation === "horizontal" ? "ns-resize" : "ew-resize";
+  getCutCursor(axis = useViewerStore.getState().cut.axis) {
+    if (axis === "x") return "ew-resize";
+    return "ns-resize";
   }
 
   getCutState() {
     return useViewerStore.getState().cut;
   }
 
-  private syncCutRangeForOrientation(
-    orientation: "horizontal" | "vertical",
+  private syncCutRangeForAxis(
+    axis: "x" | "y" | "z",
     opts?: { center?: boolean; preserveRatio?: boolean }
   ) {
     const bounds = this.cutBounds;
     if (!bounds) return;
 
-    const min = orientation === "horizontal" ? bounds.zMin : bounds.xMin;
-    const max = orientation === "horizontal" ? bounds.zMax : bounds.xMax;
+    const min = axis === "x" ? bounds.xMin : axis === "y" ? bounds.yMin : bounds.zMin;
+    const max = axis === "x" ? bounds.xMax : axis === "y" ? bounds.yMax : bounds.zMax;
     const span = max - min;
     const cut = useViewerStore.getState().cut;
 
@@ -1279,7 +1391,8 @@ export class ViewerApp {
     }
     offset = THREE.MathUtils.clamp(offset, min, max);
 
-    useViewerStore.getState().setCut({ orientation, min, max, offset });
+    const orientation: "horizontal" | "vertical" = axis === this.modelUpAxis ? "horizontal" : "vertical";
+    useViewerStore.getState().setCut({ orientation, axis, min, max, offset });
   }
 
   getMeasurementMode(): ViewerMeasurementMode {
@@ -1515,9 +1628,16 @@ export class ViewerApp {
     if (this.fragments.list.size > 0) {
       const bounds = new THREE.Box3();
       bounds.makeEmpty();
+      const tmp = new THREE.Box3();
       for (const model of this.fragments.list.values()) {
-        bounds.union(model.box);
+        model.object.updateWorldMatrix(true, true);
+        tmp.setFromObject(model.object);
+        bounds.union(tmp);
       }
+      return bounds.isEmpty() ? null : bounds;
+    }
+    if (this.glbRoot) {
+      const bounds = new THREE.Box3().setFromObject(this.glbRoot);
       return bounds.isEmpty() ? null : bounds;
     }
     return this.glbBounds ? this.glbBounds.clone() : null;
@@ -1564,7 +1684,7 @@ export class ViewerApp {
     const center = bounds.getCenter(new THREE.Vector3());
     const size = bounds.getSize(new THREE.Vector3());
     const radius = Math.max(size.length(), 1) * 1.4;
-    const dir = new THREE.Vector3(1, -1, 0.75).normalize();
+    const dir = this.getDefault3dDirection();
     const pos = center.clone().addScaledVector(dir, radius);
 
     await this.settleOrWarn(
@@ -1578,6 +1698,7 @@ export class ViewerApp {
   async frameModel() {
     const meshes = this.getCurrentModelMeshes();
     if (meshes.length === 0) return;
+    this.cameraComponent.three.up.copy(this.getModelUpVector(1));
     const bounds = this.getCurrentModelBounds();
     if (bounds) {
       this.updateCameraBoundsFromBox(bounds, { syncCut: false });
@@ -1594,13 +1715,14 @@ export class ViewerApp {
 
     if (mode === "3d") {
       await this.cameraComponent.projection.set("Perspective");
+      this.cameraComponent.three.up.copy(this.getModelUpVector(1));
       const bounds = this.getCurrentModelBounds();
       if (!bounds) return;
       this.updateCameraBoundsFromBox(bounds, { syncCut: false });
       const center = bounds.getCenter(new THREE.Vector3());
       const size = bounds.getSize(new THREE.Vector3());
       const radius = Math.max(size.length(), 1) * 1.25;
-      const dir = new THREE.Vector3(1, -1, 0.75).normalize();
+      const dir = this.getDefault3dDirection();
       const pos = center.clone().addScaledVector(dir, radius);
       await this.settleOrWarn(
         this.cameraComponent.controls.setLookAt(pos.x, pos.y, pos.z, center.x, center.y, center.z, true),
@@ -1631,23 +1753,33 @@ export class ViewerApp {
     const size = bounds.getSize(new THREE.Vector3());
     const radius = Math.max(size.length(), 1) * 1.35;
 
-    const directionMap: Record<ViewerViewPreset, THREE.Vector3> = {
-      top: new THREE.Vector3(0, 0, 1),
-      bottom: new THREE.Vector3(0, 0, -1),
-      front: new THREE.Vector3(0, -1, 0),
-      left: new THREE.Vector3(-1, 0, 0),
-      right: new THREE.Vector3(1, 0, 0),
-      back: new THREE.Vector3(0, 1, 0),
-    };
+    const directionMap: Record<ViewerViewPreset, THREE.Vector3> =
+      this.modelUpAxis === "z"
+        ? {
+            top: new THREE.Vector3(0, 0, 1),
+            bottom: new THREE.Vector3(0, 0, -1),
+            front: new THREE.Vector3(0, -1, 0),
+            left: new THREE.Vector3(-1, 0, 0),
+            right: new THREE.Vector3(1, 0, 0),
+            back: new THREE.Vector3(0, 1, 0),
+          }
+        : {
+            top: new THREE.Vector3(0, 1, 0),
+            bottom: new THREE.Vector3(0, -1, 0),
+            front: new THREE.Vector3(0, 0, -1),
+            left: new THREE.Vector3(-1, 0, 0),
+            right: new THREE.Vector3(1, 0, 0),
+            back: new THREE.Vector3(0, 0, 1),
+          };
 
     const dir = directionMap[preset].clone().normalize();
     const pos = center.clone().addScaledVector(dir, radius);
     const up =
       preset === "top"
-        ? new THREE.Vector3(0, 1, 0)
+        ? this.getTopViewUpVector(1)
         : preset === "bottom"
-          ? new THREE.Vector3(0, -1, 0)
-          : new THREE.Vector3(0, 0, 1);
+          ? this.getTopViewUpVector(-1)
+          : this.getModelUpVector(1);
 
     if (opts?.orthographic) {
       await this.cameraComponent.projection.set("Orthographic");
@@ -1737,6 +1869,8 @@ export class ViewerApp {
           `fragments model dispose (${model.modelId ?? "unknown"})`
         );
       }
+      this.modelTransform.setTarget(null);
+      this.modelTransform.setEnabled(false);
 
       this.classGroupItems.clear();
       this.storeyGroupItems.clear();
@@ -1805,6 +1939,8 @@ export class ViewerApp {
     // Dispose previous models (if any).
     this.section.clearMaterials();
     this.disposeGlbRoot();
+    this.modelUpAxis = "z";
+    this.cameraComponent.three.up.copy(this.getModelUpVector(1));
     for (const model of this.fragments.list.values()) {
       this.scene.remove(model.object);
       await this.settleOrWarn(
@@ -1813,6 +1949,8 @@ export class ViewerApp {
         `fragments model dispose (${model.modelId ?? "unknown"})`
       );
     }
+    this.modelTransform.setTarget(null);
+    this.modelTransform.setEnabled(false);
 
     this.classGroupItems.clear();
     this.storeyGroupItems.clear();
@@ -1867,12 +2005,14 @@ export class ViewerApp {
 
     // Register materials for clipping (after BVH so we don't fight buffer transfers).
     this.section.registerMaterialsFrom(model.object);
+    this.syncModelTransformTarget();
 
     await this.cameraComponent.projection.set("Perspective");
     await this.frameModel();
 
     // Populate class + storey groups for UI (tree/filters).
     await this.buildGroupsForModel(model);
+    this.syncCutRangeForAxis(this.modelUpAxis, { center: true });
 
     // Keep visibility/cut/filter states coherent after loading.
     await this.applyVisibilityFromState();
@@ -1896,20 +2036,31 @@ export class ViewerApp {
     root.name = `GLB:${name}`;
     root.updateWorldMatrix(true, true);
 
+    this.modelUpAxis = this.detectUpAxisFromObject(root);
+    this.cameraComponent.three.up.copy(this.getModelUpVector(1));
+
     this.scene.add(root);
     this.glbRoot = root;
+    this.syncModelTransformTarget();
 
     const box = new THREE.Box3().setFromObject(root);
     this.glbBounds = box.clone();
     this.updateCameraBoundsFromBox(box);
+    this.syncCutRangeForAxis(this.modelUpAxis, { center: true });
 
     // Section box starts from model bounds.
     this.section.resetBoxToBounds(box);
 
     // Register materials for clipping and frame quickly so the user can interact immediately.
     this.section.registerMaterialsFrom(root);
-    await this.cameraComponent.projection.set("Perspective");
-    await this.frameModel();
+    await this.settleOrWarn(this.cameraComponent.projection.set("Perspective"), 1200, "projection.set(Perspective)", {
+      warnOnTimeout: false,
+      warnOnReject: false,
+    });
+    await this.settleOrWarn(this.frameModel(), 2200, "frameModel(GLB)", {
+      warnOnTimeout: false,
+      warnOnReject: false,
+    });
     this.cameraComponent.enabled = true;
 
     // NOTE: We intentionally skip GLB BVH building here.
@@ -1921,7 +2072,10 @@ export class ViewerApp {
       warnOnTimeout: false,
       warnOnReject: false,
     });
-    await this.setActiveTool("select");
+    await this.settleOrWarn(this.setActiveTool("select"), 1200, "setActiveTool(select)", {
+      warnOnTimeout: false,
+      warnOnReject: false,
+    });
   }
 
   private async buildGroupsForModel(model: FRAGS.FragmentsModel) {
@@ -1947,7 +2101,8 @@ export class ViewerApp {
     const geometryIds = await model.getItemsIdsWithGeometry();
     const geometryBoxes = await model.getBoxes(geometryIds);
     const boxMap = new Map<number, THREE.Box3>();
-    const cutSamples: Array<{ localId: number; sampleX: number; sampleZ: number; classId?: string }> = [];
+    const cutSamples: Array<{ localId: number; sampleX: number; sampleY: number; sampleZ: number; classId?: string }> =
+      [];
     const tmpCenter = new THREE.Vector3();
     for (let i = 0; i < geometryIds.length; i++) {
       const lid = geometryIds[i];
@@ -1958,6 +2113,7 @@ export class ViewerApp {
       cutSamples.push({
         localId: lid,
         sampleX: tmpCenter.x,
+        sampleY: tmpCenter.y,
         sampleZ: tmpCenter.z,
         classId: classByItem.get(lid),
       });
@@ -2300,6 +2456,41 @@ export class ViewerApp {
     }
   }
 
+  setSectionGizmoVisible(visible: boolean) {
+    useViewerStore.getState().setSection({ showGizmo: visible });
+    this.section.setGizmoVisible(visible);
+  }
+
+  enableModelTransformEditing(active: boolean) {
+    const target = this.getTransformTargetRoot();
+    this.modelTransform.setTarget(target);
+    this.modelTransform.setEnabled(active && Boolean(target));
+    if (!target && active) {
+      toast("Model transform", { description: "Load a model first." });
+      void this.setActiveTool("select");
+      return;
+    }
+    if (!active) {
+      this.cameraComponent.enabled = true;
+    }
+  }
+
+  setModelTransformMode(mode: "translate" | "rotate") {
+    useViewerStore.getState().setTransform({ mode });
+    this.modelTransform.setMode(mode);
+  }
+
+  setModelTransformGizmoVisible(visible: boolean) {
+    useViewerStore.getState().setTransform({ gizmoVisible: visible });
+    this.modelTransform.setGizmoVisible(visible);
+  }
+
+  resetModelTransform() {
+    this.modelTransform.resetTargetTransform();
+    this.applyModelTransformRefresh();
+    this.noteHistory("tool", "Model transform reset");
+  }
+
   enableCut(enabled: boolean) {
     useViewerStore.getState().setCut({ enabled });
     this.queueApplyCut();
@@ -2307,9 +2498,13 @@ export class ViewerApp {
   }
 
   setCutOrientation(orientation: "horizontal" | "vertical") {
-    useViewerStore.getState().setCut({ orientation });
-    this.syncCutRangeForOrientation(orientation, { preserveRatio: true });
-    if (useViewerStore.getState().activeTool === "cut") this.setCursor(this.getCutCursor(orientation));
+    const axis = orientation === "horizontal" ? this.modelUpAxis : "x";
+    this.setCutAxis(axis);
+  }
+
+  setCutAxis(axis: "x" | "y" | "z") {
+    this.syncCutRangeForAxis(axis, { preserveRatio: true });
+    if (useViewerStore.getState().activeTool === "cut") this.setCursor(this.getCutCursor(axis));
     this.queueApplyCut();
   }
 
@@ -2542,7 +2737,7 @@ export class ViewerApp {
     }
 
     this.section.setMode("plane");
-    this.section.setPlaneAxis(cut.orientation === "horizontal" ? "z" : "x");
+    this.section.setPlaneAxis(cut.axis);
     this.section.setPlaneOffset(cut.offset);
     this.section.setInvert(cut.flip);
     this.section.setEnabled(true);
@@ -2568,6 +2763,11 @@ export class ViewerApp {
     let sliceStart = performance.now();
 
     for (const [modelId, samples] of this.itemCutSamplesByModel) {
+      const modelObj = this.fragments.list.get(modelId)?.object;
+      if (modelObj) modelObj.updateMatrixWorld(true);
+      const worldMatrix = modelObj?.matrixWorld ?? null;
+      const tmpWorldSample = new THREE.Vector3();
+
       let target = hidden[modelId];
       if (!target) {
         target = new Set<number>();
@@ -2578,7 +2778,13 @@ export class ViewerApp {
         const classId = sample.classId;
         if (classId && ignored.has(classId)) continue;
 
-        const axisValue = cut.orientation === "horizontal" ? sample.sampleZ : sample.sampleX;
+        let axisValue: number;
+        if (worldMatrix) {
+          tmpWorldSample.set(sample.sampleX, sample.sampleY, sample.sampleZ).applyMatrix4(worldMatrix);
+          axisValue = cut.axis === "x" ? tmpWorldSample.x : cut.axis === "y" ? tmpWorldSample.y : tmpWorldSample.z;
+        } else {
+          axisValue = cut.axis === "x" ? sample.sampleX : cut.axis === "y" ? sample.sampleY : sample.sampleZ;
+        }
         const shouldHide = cut.flip ? axisValue > cut.offset : axisValue < cut.offset;
         if (shouldHide) target.add(sample.localId);
 
@@ -2690,9 +2896,12 @@ export class ViewerApp {
     useViewerStore.getState().setCoordinates(null);
     useViewerStore.getState().setCut({
       enabled: false,
+      axis: this.modelUpAxis,
+      orientation: "horizontal",
       flip: false,
       ignoredClasses: [],
     });
+    this.syncCutRangeForAxis(this.modelUpAxis, { center: true });
     for (const model of this.fragments.list.values()) {
       await model.resetColor(undefined);
     }
@@ -2700,9 +2909,13 @@ export class ViewerApp {
     this.setSectionInvert(false);
     this.setSectionEnabled(false);
     this.setSectionLockRotation(false);
+    this.setSectionGizmoVisible(true);
     this.setSectionTransformMode("translate");
     this.section.setBoxEditing(false);
     this.resetSectionBox();
+    this.setModelTransformMode("rotate");
+    this.setModelTransformGizmoVisible(true);
+    this.resetModelTransform();
 
     this.clearMeasurements();
     await this.cameraComponent.projection.set("Perspective");

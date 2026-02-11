@@ -23,7 +23,7 @@ export function StatusBar() {
         <Badge variant="muted">Selected: {selectedCount}</Badge>
         {activeTool === "cut" && cut.enabled ? (
           <Badge variant="muted">
-            Cut: {cut.orientation} {cut.offset.toFixed(2)}m
+            Cut: {cut.axis.toUpperCase()} {cut.offset.toFixed(2)}m
           </Badge>
         ) : null}
         {coords ? (

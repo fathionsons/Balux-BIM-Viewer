@@ -5,6 +5,7 @@ import {
   Box,
   EyeOff,
   Focus,
+  Move,
   MousePointer2,
   Palette,
   Ruler,
@@ -26,10 +27,11 @@ import { cn } from "../../lib/utils";
 export function LeftToolbar() {
   const { viewer } = useViewer();
   const activeTool = useViewerStore((s) => s.activeTool);
+  const cut = useViewerStore((s) => s.cut);
   const setRightPanelTab = useViewerStore((s) => s.setRightPanelTab);
   const isTouchDevice = useViewerStore((s) => s.isTouchDevice);
 
-  const setTool = async (tool: "select" | "measure" | "cut" | "section") => {
+  const setTool = async (tool: "select" | "measure" | "cut" | "section" | "transform") => {
     if (!viewer) return;
     await viewer.setActiveTool(tool);
   };
@@ -66,6 +68,13 @@ export function LeftToolbar() {
             onClick={() => setTool("section")}
             disabled={isTouchDevice}
           />
+          <ToolButton
+            active={activeTool === "transform"}
+            icon={<Move className="h-4 w-4" />}
+            label={isTouchDevice ? `${advancedMsg}` : "Transform model (G)"}
+            onClick={() => setTool("transform")}
+            disabled={isTouchDevice}
+          />
 
           <div className="my-2 h-px bg-slate-200" />
 
@@ -94,6 +103,25 @@ export function LeftToolbar() {
             onClick={() => viewer?.reset()}
           />
         </div>
+
+        {activeTool === "cut" && !isTouchDevice ? (
+          <div className="pointer-events-auto mt-2 rounded-xl border border-slate-200 bg-white/90 p-1.5 shadow-panel backdrop-blur">
+            <div className="mb-1 text-center text-[10px] font-medium uppercase tracking-wide text-slate-500">Cut</div>
+            <div className="grid grid-cols-3 gap-1">
+              {(["x", "y", "z"] as const).map((axis) => (
+                <Button
+                  key={axis}
+                  variant={cut.axis === axis ? "default" : "outline"}
+                  size="sm"
+                  className="h-7 rounded-md px-2 text-[11px] uppercase"
+                  onClick={() => viewer?.setCutAxis(axis)}
+                >
+                  {axis}
+                </Button>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </div>
     </TooltipProvider>
   );

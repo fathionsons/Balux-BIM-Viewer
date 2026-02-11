@@ -2,7 +2,7 @@
 
 export type ViewerTopTab = "viewer" | "info" | "site" | "fm";
 
-export type ViewerToolId = "select" | "measure" | "cut" | "section";
+export type ViewerToolId = "select" | "measure" | "cut" | "section" | "transform";
 
 export type ViewerRightPanelTab = "properties" | "filters" | "history";
 
@@ -65,16 +65,23 @@ export type ViewerSectionState = {
   invert: boolean;
   transformMode: "translate" | "rotate" | "scale";
   lockRotation: boolean;
+  showGizmo: boolean;
 };
 
 export type ViewerCutState = {
   enabled: boolean;
   orientation: "horizontal" | "vertical";
+  axis: "x" | "y" | "z";
   flip: boolean;
   offset: number;
   min: number;
   max: number;
   ignoredClasses: string[];
+};
+
+export type ViewerTransformState = {
+  mode: "translate" | "rotate";
+  gizmoVisible: boolean;
 };
 
 export type ViewerFilterOperator =
@@ -167,6 +174,9 @@ export type ViewerStore = {
   cut: ViewerCutState;
   setCut: (next: Partial<ViewerCutState>) => void;
   setCutIgnoredClass: (classId: string, ignored: boolean) => void;
+
+  transform: ViewerTransformState;
+  setTransform: (next: Partial<ViewerTransformState>) => void;
 
   propertyFilter: ViewerPropertyFilterState;
   setPropertyFilter: (next: Partial<ViewerPropertyFilterState>) => void;
@@ -263,12 +273,14 @@ export const useViewerStore = create<ViewerStore>((set, get) => ({
     invert: false,
     transformMode: "translate",
     lockRotation: false,
+    showGizmo: true,
   },
   setSection: (next) => set((s) => ({ section: { ...s.section, ...next } })),
 
   cut: {
     enabled: false,
     orientation: "horizontal",
+    axis: "z",
     flip: false,
     offset: 0,
     min: -1,
@@ -283,6 +295,12 @@ export const useViewerStore = create<ViewerStore>((set, get) => ({
       else list.delete(classId);
       return { cut: { ...s.cut, ignoredClasses: [...list].sort() } };
     }),
+
+  transform: {
+    mode: "rotate",
+    gizmoVisible: true,
+  },
+  setTransform: (next) => set((s) => ({ transform: { ...s.transform, ...next } })),
 
   propertyFilter: {
     pset: "",

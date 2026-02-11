@@ -39,6 +39,7 @@ export class SectionManager {
   private controlsHelper: THREE.Object3D;
   private editing = false;
   private lockRotation = false;
+  private gizmoVisible = true;
   private boxPlaneUpdateRaf = 0;
   private readonly localPoints = [
     new THREE.Vector3(0.5, 0, 0), // +X
@@ -243,6 +244,15 @@ export class SectionManager {
     this.updateGizmoVisibility();
   }
 
+  setGizmoVisible(visible: boolean) {
+    this.gizmoVisible = visible;
+    this.updateGizmoVisibility();
+  }
+
+  getGizmoVisible() {
+    return this.gizmoVisible;
+  }
+
   setTransformMode(mode: "translate" | "rotate" | "scale") {
     if (this.lockRotation && mode === "rotate") {
       this.controls.setMode("translate");
@@ -268,8 +278,8 @@ export class SectionManager {
 
   private updateGizmoVisibility() {
     const boxMode = this.enabled && this.mode === "box";
-    this.box.visible = boxMode;
-    this.controlsHelper.visible = boxMode && this.editing;
+    this.box.visible = boxMode && this.gizmoVisible;
+    this.controlsHelper.visible = boxMode && this.editing && this.gizmoVisible;
     if (boxMode) {
       this.controls.attach(this.box);
     } else {
