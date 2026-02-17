@@ -154,3 +154,6 @@ Optional: add a GLB visual model at `public/house.glb` (or `public/models/house.
 
 Inspired by:
 <img width="2000" height="855" alt="dalux_logo_" src="https://github.com/user-attachments/assets/920f42d7-4b0c-47c6-84b7-dc1f3f48ec71" />
+<img width="1536" height="672" alt="BaluxwithBackground" src="https://github.com/user-attachments/assets/f879d2fb-08a9-4401-bee3-20afd7aa2084" />
+<img width="755" height="330" alt="balux" src="https://github.com/user-attachments/assets/e947ceea-28f4-4930-8483-ae98a340195f" />
+
