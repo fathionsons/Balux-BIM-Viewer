@@ -151,3 +151,5 @@ Optional: add a GLB visual model at `public/house.glb` (or `public/models/house.
 3. 2D drawings overlay (plan sheets + 3D alignment)
 4. Smarter measurement modes (axis-aligned, shortest distance between objects)
 5. Saved views, annotations, and scene states (filters + section + visibility presets)
+Inspired by:
+<img width="2000" height="855" alt="dalux_logo_" src="https://github.com/user-attachments/assets/920f42d7-4b0c-47c6-84b7-dc1f3f48ec71" />
