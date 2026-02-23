@@ -14,9 +14,10 @@ const buttonVariants = cva(
         default: "bg-primary text-primary-foreground hover:bg-primary/90",
         secondary:
           "bg-secondary text-secondary-foreground hover:bg-secondary/80",
-        ghost: "hover:bg-slate-100 hover:text-slate-900",
+        ghost:
+          "text-[hsl(var(--balux-blue-gray))] hover:bg-[hsl(var(--balux-green)/0.12)] hover:text-[hsl(var(--balux-blue-gray))]",
         outline:
-          "border border-slate-200 bg-white hover:bg-slate-50 hover:text-slate-900",
+          "border border-[hsl(var(--balux-blue-gray)/0.28)] bg-white text-[hsl(var(--balux-blue-gray))] hover:border-[hsl(var(--balux-green)/0.75)] hover:bg-[hsl(var(--balux-green)/0.12)] hover:text-[hsl(var(--balux-blue-gray))]",
         destructive:
           "bg-destructive text-destructive-foreground hover:bg-destructive/90",
       },

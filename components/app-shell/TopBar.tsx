@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Image from "next/image";
 import { FolderOpen, RotateCcw, Upload } from "lucide-react";
 import { toast } from "sonner";
 
@@ -138,9 +139,16 @@ export function TopBar() {
   return (
     <div className="flex h-[52px] items-center justify-between border-b border-slate-200 bg-white/75 px-3 backdrop-blur">
       <div className="flex items-center gap-3">
-        <div className="flex items-baseline gap-2">
-          <div className="text-sm font-semibold tracking-tight text-slate-900">
-            BALUX BIM Viewer
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 text-sm font-semibold tracking-tight text-slate-900">
+            <Image
+              src="/balux-cropped.png"
+              alt="Balux logo"
+              width={466}
+              height={123}
+              className="h-9 w-auto object-contain"
+              priority
+            />
           </div>
           <div className="text-xs text-slate-500">
             {modelName ? `Model: ${modelName}` : "No model loaded"}
