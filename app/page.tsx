@@ -30,8 +30,8 @@ export default function HomePage() {
               </p>
               <p className="mt-3 text-sm font-medium text-slate-700">By Fathi</p>
               <p className="mt-2 max-w-2xl text-xs text-slate-500 md:text-sm">
-                Disclaimer: This is not a commercial product - it is a demonstration project created to showcase my
-                work to Dalux.
+                Disclaimer: This is a non-commercial demonstration project inspired by BIM workflows and created to
+                showcase my technical work. It is not affiliated with or endorsed by Dalux.
               </p>
 
               <div className="mt-7 flex flex-wrap items-center gap-3">
